@@ -1,0 +1,14 @@
+node_modules
+apps/server/dist
+apps/web/dist
+dist
+runtime
+backups
+coverage
+.vite
+.git
+.gitignore
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+npm-debug.log

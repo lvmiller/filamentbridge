@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/shared" },
+    { "path": "packages/crypto" },
+    { "path": "packages/db" },
+    { "path": "packages/printer-connector" },
+    { "path": "apps/server" }
+  ]
+}

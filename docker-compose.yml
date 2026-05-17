@@ -1,0 +1,34 @@
+services:
+  filamentbridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: filamentbridge:local
+    restart: unless-stopped
+    ports:
+      - "${FILAMENTBRIDGE_PORT:-3000}:3000"
+    environment:
+      FILAMENTBRIDGE_BASE_URL: "${FILAMENTBRIDGE_BASE_URL:-http://filamentbridge.local:3000}"
+      FILAMENTBRIDGE_ALLOWED_ORIGINS: "${FILAMENTBRIDGE_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:5173}"
+      FILAMENTBRIDGE_APP_SECRET: "${FILAMENTBRIDGE_APP_SECRET:-change-this-local-secret}"
+      FILAMENTBRIDGE_DATABASE_PATH: /data/filamentbridge.sqlite
+      FILAMENTBRIDGE_KEY_DIR: /keys
+      FILAMENTBRIDGE_BACKUP_DIR: /backups
+      FILAMENTBRIDGE_WEB_DIST: /app/apps/web/dist
+      FILAMENTBRIDGE_PRINTER_CONNECTOR_ENABLED: "${FILAMENTBRIDGE_PRINTER_CONNECTOR_ENABLED:-true}"
+      FILAMENTBRIDGE_BAMBU_MQTT_INSECURE_TLS: "${FILAMENTBRIDGE_BAMBU_MQTT_INSECURE_TLS:-false}"
+    volumes:
+      - filamentbridge-data:/data
+      - filamentbridge-keys:/keys
+      - filamentbridge-backups:/backups
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  filamentbridge-data:
+  filamentbridge-keys:
+  filamentbridge-backups:

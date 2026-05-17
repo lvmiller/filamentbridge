@@ -1,0 +1,55 @@
+{
+  "name": "filamentbridge",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Self-hosted local-first filament inventory for Bambu workflows using FilamentBridge-owned companion NFC tags.",
+  "workspaces": [
+    "packages/shared",
+    "packages/crypto",
+    "packages/db",
+    "packages/printer-connector",
+    "apps/server",
+    "apps/web"
+  ],
+  "scripts": {
+    "build": "node scripts/build-server.mjs && npm run build:web",
+    "build:web": "vite build --config apps/web/vite.config.ts",
+    "typecheck": "tsc -p tsconfig.check.json --pretty false",
+    "test": "vitest run --config vitest.config.ts",
+    "dev": "tsx apps/server/src/index.ts",
+    "dev:web": "vite --config apps/web/vite.config.ts --host 0.0.0.0",
+    "start": "node apps/server/dist/index.cjs",
+    "lint": "npm run typecheck",
+    "check:ios": "node tools/check-ios.mjs",
+    "smoke:docker": "node tests/docker-smoke.mjs"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/static": "^8.2.0",
+    "@fastify/swagger": "^9.5.1",
+    "@fastify/swagger-ui": "^5.2.3",
+    "bcryptjs": "^3.0.2",
+    "fastify": "^5.5.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "mqtt": "^5.14.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.3.0",
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.25.12",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.2",
+    "jsdom": "^26.1.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.5",
+    "vitest": "^3.2.4"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "baseUrl": ".",
+    "paths": {
+      "@filamentbridge/shared": ["packages/shared/src/index.ts"],
+      "@filamentbridge/crypto": ["packages/crypto/src/index.ts"],
+      "@filamentbridge/db": ["packages/db/src/index.ts"],
+      "@filamentbridge/printer-connector": ["packages/printer-connector/src/index.ts"]
+    }
+  }
+}
