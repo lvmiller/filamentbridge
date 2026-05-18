@@ -5,6 +5,7 @@ import {
   type AuthSession,
   type Device,
   type FilamentCatalogItem,
+  type LabelTemplate,
   type NfcScanResult,
   type NfcTag,
   type NfcWritePayloadResult,
@@ -12,10 +13,11 @@ import {
   type PrinterSlot,
   type SetupStatus,
   type Spool,
+  type RenderedLabels,
   type UsageEvent
 } from '@filamentbridge/shared';
 
-type Screen = 'dashboard' | 'inventory' | 'catalog' | 'spool' | 'printers' | 'usage' | 'nfc' | 'backup' | 'security';
+type Screen = 'dashboard' | 'inventory' | 'catalog' | 'spool' | 'printers' | 'usage' | 'nfc' | 'labels' | 'backup' | 'security';
 
 type AppState = {
   setup: SetupStatus | null;
@@ -26,6 +28,7 @@ type AppState = {
   printers: Printer[];
   slots: PrinterSlot[];
   usage: UsageEvent[];
+  labelTemplates: LabelTemplate[];
   devices: Device[];
 };
 
@@ -38,6 +41,7 @@ const initialState: AppState = {
   printers: [],
   slots: [],
   usage: [],
+  labelTemplates: [],
   devices: []
 };
 
@@ -70,17 +74,18 @@ export function App(): ReactElement {
       return;
     }
     client.setToken(session.token);
-    const [catalog, spools, tags, printers, usage, devices] = await Promise.all([
+    const [catalog, spools, tags, printers, usage, devices, labelTemplates] = await Promise.all([
       client.get<FilamentCatalogItem[]>('/api/catalog-items'),
       client.get<Spool[]>('/api/spools'),
       client.get<NfcTag[]>('/api/nfc/tags'),
       client.get<Printer[]>('/api/printers'),
       client.get<UsageEvent[]>('/api/usage-events'),
-      client.get<Device[]>('/api/devices')
+      client.get<Device[]>('/api/devices'),
+      client.get<LabelTemplate[]>('/api/labels/templates')
     ]);
     const firstPrinter = printers[0];
     const slots = firstPrinter === undefined ? [] : await client.get<PrinterSlot[]>(`/api/printers/${firstPrinter.id}/slots`);
-    setState({ setup, session, catalog, spools, tags, printers, slots, usage, devices });
+    setState({ setup, session, catalog, spools, tags, printers, slots, usage, devices, labelTemplates });
   }
 
   useEffect(() => {
@@ -134,6 +139,7 @@ export function App(): ReactElement {
         {screen === 'printers' && <PrinterScreen state={state} client={client} run={run} />}
         {screen === 'usage' && <UsageReviewScreen usage={state.usage} client={client} run={run} />}
         {screen === 'nfc' && <NfcAuditScreen state={state} client={client} run={run} />}
+        {screen === 'labels' && <LabelsScreen state={state} client={client} run={run} />}
         {screen === 'backup' && <BackupScreen client={client} run={run} />}
         {screen === 'security' && <SecurityScreen state={state} client={client} run={run} />}
       </main>
@@ -149,6 +155,7 @@ const navItems: Array<{ screen: Screen; label: string }> = [
   { screen: 'printers', label: 'Printer setup' },
   { screen: 'usage', label: 'Usage review' },
   { screen: 'nfc', label: 'NFC audit' },
+  { screen: 'labels', label: 'Labels' },
   { screen: 'backup', label: 'Backup/export' },
   { screen: 'security', label: 'Security/devices' }
 ];
@@ -254,7 +261,7 @@ function InventoryScreen({ state, client, run, selectSpool }: { state: AppState;
         {state.spools.map((spool) => (
           <article className="panel" key={spool.id}>
             <h3><span className="color" style={{ background: spool.color_hex }} />{spool.display_name}</h3>
-            <small>{spool.material_type} · {spool.remaining_filament_weight_g} g · {spool.status}</small>
+            <small>{spool.material_type} · {spool.remaining_filament_weight_g} g · {spool.status} · code {spool.short_code}</small>
             <div className="actions">
               <button onClick={() => selectSpool(spool.id)}>Open details</button>
               <button
@@ -279,7 +286,7 @@ function SpoolDetail({ spool, tags, usage, client, run }: { spool: Spool | null;
   const [weight, setWeight] = useState(spool?.remaining_filament_weight_g.toString() ?? '0');
   if (spool === null) return <section><h2>Spool detail</h2><p>Create a spool to see detail.</p></section>;
   const tag = tags.find((candidate) => candidate.id === spool.active_tag_id);
-  return <section><h2>Spool detail</h2><article className="panel"><h3>{spool.display_name}</h3><p>{spool.material_type} · {spool.remaining_filament_weight_g} g remaining · tag {tag?.status ?? 'none'}</p><form className="inline" onSubmit={(event) => { event.preventDefault(); void run(async () => { await client.post('/api/usage-events/adjustment', { spool_id: spool.id, expected_version: spool.version, new_remaining_weight_g: Number(weight), notes: 'Manual web adjustment' }); }, 'Manual adjustment saved'); }}><label>Remaining grams<input type="number" value={weight} onChange={(event) => setWeight(event.target.value)} /></label><button>Save adjustment</button></form><button className="danger" onClick={() => { if (window.confirm(`Remove spool ${spool.display_name} from active inventory?`)) void run(async () => { await client.post(`/api/spools/${spool.id}/delete`, { expected_version: spool.version }); }, 'Spool removed'); }}>Remove spool</button></article><h3>Weight history</h3><DataTable rows={usage.filter((event) => event.spool_id === spool.id).map((event) => [event.source, event.delta_weight_g, event.before_weight_g, event.after_weight_g, event.review_status])} headers={['Source', 'Delta', 'Before', 'After', 'Review']} /></section>;
+  return <section><h2>Spool detail</h2><article className="panel"><h3>{spool.display_name}</h3><p>{spool.material_type} · {spool.remaining_filament_weight_g} g remaining · code {spool.short_code} · tag {tag?.status ?? 'none'}</p><form className="inline" onSubmit={(event) => { event.preventDefault(); void run(async () => { await client.post('/api/usage-events/adjustment', { spool_id: spool.id, expected_version: spool.version, new_remaining_weight_g: Number(weight), notes: 'Manual web adjustment' }); }, 'Manual adjustment saved'); }}><label>Remaining grams<input type="number" value={weight} onChange={(event) => setWeight(event.target.value)} /></label><button>Save adjustment</button></form><button className="danger" onClick={() => { if (window.confirm(`Remove spool ${spool.display_name} from active inventory?`)) void run(async () => { await client.post(`/api/spools/${spool.id}/delete`, { expected_version: spool.version }); }, 'Spool removed'); }}>Remove spool</button></article><h3>Weight history</h3><DataTable rows={usage.filter((event) => event.spool_id === spool.id).map((event) => [event.source, event.delta_weight_g, event.before_weight_g, event.after_weight_g, event.estimated_material_cost_amount === null ? '—' : `${event.estimated_material_cost_amount} ${event.estimated_material_cost_currency ?? ''}`, event.review_status])} headers={['Source', 'Delta', 'Before', 'After', 'Cost', 'Review']} /></section>;
 }
 
 function PrinterScreen({ state, client, run }: { state: AppState; client: FilamentBridgeClient; run: (action: () => Promise<void>, success: string) => Promise<void> }): ReactElement {
@@ -293,7 +300,7 @@ function PrinterScreen({ state, client, run }: { state: AppState; client: Filame
   return (
     <section>
       <h2>Printer setup and slot mapping</h2>
-      <p className="boundary">FilamentBridge does not run an MQTT broker in Docker. LAN/VPN-LAN connects directly to your printer at the configured host on port 8883 and subscribes to <code>device/&lt;MQTT device ID&gt;/report</code>. The device ID is usually the printer serial and must match the printer MQTT topic identifier; the separate serial field is stored only as a local identity hash and fallback.</p>
+      <p className="boundary">FilamentBridge runs an internal lightweight MQTT connection service. LAN/VPN-LAN opens outbound TLS MQTT sessions to your printer at the configured host on port 8883 and subscribes to <code>device/&lt;MQTT device ID&gt;/report</code>. The device ID is usually the printer serial and must match the printer MQTT topic identifier; the separate serial field is stored only as a local identity hash and fallback.</p>
       <form className="grid-form" onSubmit={(event) => {
         event.preventDefault();
         void run(async () => {
@@ -359,6 +366,30 @@ function NfcAuditScreen({ state, client, run }: { state: AppState; client: Filam
   const [encoded, setEncoded] = useState('');
   const [scan, setScan] = useState<NfcScanResult | null>(null);
   return <section><h2>NFC tag audit</h2><p>{OFFICIAL_RFID_BOUNDARY}</p><form className="grid-form" onSubmit={(event) => { event.preventDefault(); const spool = state.spools.find((candidate) => candidate.id === spoolId); if (spool) void run(async () => { await client.post('/api/nfc/assign', { spool_id: spool.id, tag_uid: tagUid, expected_spool_version: spool.version }); }, 'Tag assigned'); }}><label>Tag UID<input value={tagUid} onChange={(event) => setTagUid(event.target.value)} /></label><label>Spool<select value={spoolId} onChange={(event) => setSpoolId(event.target.value)}>{state.spools.map((spool) => <option key={spool.id} value={spool.id}>{spool.display_name}</option>)}</select></label><button>Assign blank companion tag</button></form><div className="list">{state.tags.map((tag) => <article className="panel" key={tag.id}><h3>{tag.status} tag</h3><p>{tag.assigned_spool_id ?? 'unassigned'} · writes {tag.write_count}</p><button disabled={tag.assigned_spool_id === null} onClick={() => run(async () => { const spool = state.spools.find((candidate) => candidate.id === tag.assigned_spool_id); if (!spool) return; const result = await client.post<NfcWritePayloadResult>('/api/nfc/write-payload', { tag_id: tag.id, spool_id: spool.id, expected_spool_version: spool.version, force_stale_rewrite: true }); setEncoded(result.encoded_payload); }, 'Payload generated for iOS write')}>Generate write payload</button><button onClick={() => run(async () => { await client.post('/api/nfc/retire', { tag_id: tag.id, expected_version: tag.version }); }, 'Tag retired')}>Retire</button></article>)}</div><form onSubmit={(event) => { event.preventDefault(); void run(async () => { setScan(await client.post<NfcScanResult>('/api/nfc/scan', { tag_uid: tagUid, encoded_payload: encoded || null })); }, 'Scan submitted'); }}><label>Encoded payload<textarea value={encoded} onChange={(event) => setEncoded(event.target.value)} /></label><button>Verify scan</button></form>{scan && <pre>{JSON.stringify(scan, null, 2)}</pre>}</section>;
+}
+
+function LabelsScreen({ state, client, run }: { state: AppState; client: FilamentBridgeClient; run: (action: () => Promise<void>, success: string) => Promise<void> }): ReactElement {
+  const [selectedSpoolId, setSelectedSpoolId] = useState(state.spools[0]?.id ?? '');
+  const [selectedTemplateId, setSelectedTemplateId] = useState(state.labelTemplates[0]?.id ?? '');
+  const [rendered, setRendered] = useState<RenderedLabels | null>(null);
+  const selectedSpool = state.spools.find((spool) => spool.id === selectedSpoolId) ?? state.spools[0];
+  const selectedTemplate = state.labelTemplates.find((template) => template.id === selectedTemplateId) ?? state.labelTemplates[0];
+  return (
+    <section>
+      <h2>Labels and lookup</h2>
+      <p>QR/barcode labels identify local spools by short code. NFC signatures remain the trusted app-owned tag mechanism.</p>
+      <form className="grid-form" onSubmit={(event) => { event.preventDefault(); void run(async () => { const template = await client.post<LabelTemplate>('/api/labels/templates', { name: 'Default spool QR labels', medium: 'sheet', page_width_mm: 210, page_height_mm: 297, label_width_mm: 70, label_height_mm: 35, rows: 8, columns: 2, code_type: 'qr', template_text: '{{display_name}}\\n{{material_type}} · {{remaining_filament_weight_g}}g', included_fields: ['short_code', 'storage_location'] }); setSelectedTemplateId(template.id); }, 'Label template created'); }}>
+        <button>Create default QR template</button>
+      </form>
+      <form className="grid-form" onSubmit={(event) => { event.preventDefault(); if (!selectedSpool || !selectedTemplate) return; void run(async () => { setRendered(await client.post<RenderedLabels>('/api/labels/render', { template_id: selectedTemplate.id, spool_ids: [selectedSpool.id], base_url: window.location.origin })); }, 'Label rendered locally'); }}>
+        <label>Template<select value={selectedTemplateId} onChange={(event) => setSelectedTemplateId(event.target.value)}>{state.labelTemplates.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label>
+        <label>Spool<select value={selectedSpoolId} onChange={(event) => setSelectedSpoolId(event.target.value)}>{state.spools.map((spool) => <option key={spool.id} value={spool.id}>{spool.display_name} ({spool.short_code})</option>)}</select></label>
+        <button disabled={!selectedSpool || !selectedTemplate}>Render label SVG</button>
+      </form>
+      {rendered && <article className="panel"><h3>{rendered.filename}</h3><div className="label-preview" dangerouslySetInnerHTML={{ __html: rendered.svg }} /><textarea readOnly value={rendered.svg} /></article>}
+      <DataTable headers={['Template', 'Code type', 'Size', 'Last used']} rows={state.labelTemplates.map((template) => [template.name, template.code_type, `${template.label_width_mm}×${template.label_height_mm} mm`, template.last_used_at ?? 'never'])} />
+    </section>
+  );
 }
 
 function BackupScreen({ client, run }: { client: FilamentBridgeClient; run: (action: () => Promise<void>, success: string) => Promise<void> }): ReactElement {

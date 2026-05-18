@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   type MaterialType,
   type Printer,
@@ -46,6 +47,8 @@ export type PrinterSyncResult = {
 };
 
 export interface PrinterConnector {
+  start?(): Promise<void> | void;
+  stop?(): Promise<void> | void;
   testConnection(printer: Printer): Promise<TestConnectionResult>;
   syncNow(printer: Printer, existingSlots: PrinterSlot[]): Promise<PrinterSyncResult>;
 }
@@ -62,6 +65,7 @@ export type BambuLanMqttConnectorOptions = {
   connect_timeout_ms?: number;
   snapshot_timeout_ms?: number;
   mqtt_factory?: BambuMqttFactory;
+  snapshot_source?: BambuMqttSnapshotSource;
 };
 
 export type BambuMqttFactory = (url: string, options: BambuMqttConnectionOptions) => BambuMqttClientLike;
@@ -83,6 +87,32 @@ export type BambuMqttClientLike = {
   subscribe(topic: string, callback: (error?: Error | null) => void): void;
   publish(topic: string, payload: string, callback?: (error?: Error | null) => void): void;
   end(force?: boolean, callback?: () => void): void;
+};
+
+export type BambuMqttResolvedCredentials = {
+  lan_access_code: string;
+  device_id: string;
+  allow_insecure_tls?: boolean;
+};
+
+export type BambuMqttSnapshot = {
+  slots: ObservedPrinterSlot[];
+  error: string | null;
+  received_at: string;
+};
+
+export interface BambuMqttSnapshotSource {
+  start?(): Promise<void> | void;
+  stop?(): Promise<void> | void;
+  readSnapshot(printer: Printer, credentials: BambuMqttResolvedCredentials): Promise<BambuMqttSnapshot>;
+}
+
+export type BambuMqttConnectionServerOptions = {
+  connect_timeout_ms?: number;
+  snapshot_timeout_ms?: number;
+  cache_ttl_ms?: number;
+  mqtt_factory?: BambuMqttFactory;
+  now?: () => number;
 };
 
 export const compatibilityMatrixDate = '2026-05-15';
@@ -204,12 +234,22 @@ export class BambuLanMqttConnector implements PrinterConnector {
   private readonly connectTimeoutMs: number;
   private readonly snapshotTimeoutMs: number;
   private readonly mqttFactory: BambuMqttFactory | undefined;
+  private readonly snapshotSource: BambuMqttSnapshotSource | undefined;
 
   constructor(private readonly options: BambuLanMqttConnectorOptions) {
     this.fallback = options.fallback ?? new ManualMockBambuConnector();
     this.connectTimeoutMs = options.connect_timeout_ms ?? 3500;
     this.snapshotTimeoutMs = options.snapshot_timeout_ms ?? 6500;
     this.mqttFactory = options.mqtt_factory;
+    this.snapshotSource = options.snapshot_source;
+  }
+
+  async start(): Promise<void> {
+    await this.snapshotSource?.start?.();
+  }
+
+  async stop(): Promise<void> {
+    await this.snapshotSource?.stop?.();
   }
 
   async testConnection(printer: Printer): Promise<TestConnectionResult> {
@@ -225,7 +265,7 @@ export class BambuLanMqttConnector implements PrinterConnector {
     if (missing !== null) {
       return { capability_level: 'read_only', ok: false, reason: missing, observed_slots: [] };
     }
-    const snapshot = await this.fetchSnapshot(printer, credentials as ResolvedBambuLanMqttCredentials);
+    const snapshot = await this.fetchSnapshot(printer, credentials as BambuMqttResolvedCredentials);
     return {
       capability_level: 'read_only',
       ok: snapshot.error === null,
@@ -253,7 +293,7 @@ export class BambuLanMqttConnector implements PrinterConnector {
     if (missing !== null) {
       return { capability_level: 'read_only', observed_slots: [], usage_candidates: [], warnings: [missing] };
     }
-    const snapshot = await this.fetchSnapshot(printer, credentials as ResolvedBambuLanMqttCredentials);
+    const snapshot = await this.fetchSnapshot(printer, credentials as BambuMqttResolvedCredentials);
     return {
       capability_level: 'read_only',
       observed_slots: snapshot.slots,
@@ -262,20 +302,13 @@ export class BambuLanMqttConnector implements PrinterConnector {
     };
   }
 
-  private async fetchSnapshot(printer: Printer, credentials: ResolvedBambuLanMqttCredentials): Promise<{ slots: ObservedPrinterSlot[]; error: string | null }> {
+  private async fetchSnapshot(printer: Printer, credentials: BambuMqttResolvedCredentials): Promise<{ slots: ObservedPrinterSlot[]; error: string | null }> {
     try {
-      const options: BambuMqttReadOptions = {
-        host: printer.host,
-        device_id: credentials.device_id,
-        lan_access_code: credentials.lan_access_code,
-        allow_insecure_tls: credentials.allow_insecure_tls === true,
-        connect_timeout_ms: this.connectTimeoutMs,
-        snapshot_timeout_ms: this.snapshotTimeoutMs
-      };
-      if (this.mqttFactory !== undefined) {
-        options.mqtt_factory = this.mqttFactory;
+      if (this.snapshotSource !== undefined) {
+        const snapshot = await this.snapshotSource.readSnapshot(printer, credentials);
+        return { slots: snapshot.slots, error: snapshot.error };
       }
-      const report = await readOneBambuMqttReport(options);
+      const report = await readOneBambuMqttReport(createBambuMqttReadOptions(printer, credentials, this.connectTimeoutMs, this.snapshotTimeoutMs, this.mqttFactory));
       return { slots: extractBambuObservedSlots(report), error: null };
     } catch (error) {
       return { slots: [], error: error instanceof Error ? error.message : 'Bambu LAN MQTT observation failed' };
@@ -283,20 +316,151 @@ export class BambuLanMqttConnector implements PrinterConnector {
   }
 }
 
-type ResolvedBambuLanMqttCredentials = {
-  lan_access_code: string;
-  device_id: string;
-  allow_insecure_tls?: boolean;
-};
+export class BambuMqttConnectionServer implements BambuMqttSnapshotSource {
+  private readonly connectTimeoutMs: number;
+  private readonly snapshotTimeoutMs: number;
+  private readonly cacheTtlMs: number;
+  private readonly mqttFactory: BambuMqttFactory | undefined;
+  private readonly now: () => number;
+  private readonly snapshots = new Map<string, { fetched_at_ms: number; snapshot: BambuMqttSnapshot }>();
+  private readonly inFlight = new Map<string, Promise<BambuMqttSnapshot>>();
+  private readonly activeClients = new Set<BambuMqttClientLike>();
+  private abortController: AbortController | null = null;
 
-type BambuMqttReadOptions = ResolvedBambuLanMqttCredentials & {
+  constructor(options: BambuMqttConnectionServerOptions = {}) {
+    this.connectTimeoutMs = options.connect_timeout_ms ?? 3500;
+    this.snapshotTimeoutMs = options.snapshot_timeout_ms ?? 6500;
+    this.cacheTtlMs = options.cache_ttl_ms ?? 2000;
+    this.mqttFactory = options.mqtt_factory;
+    this.now = options.now ?? Date.now;
+  }
+
+  start(): void {
+    if (this.abortController === null) {
+      this.abortController = new AbortController();
+    }
+  }
+
+  stop(): void {
+    if (this.abortController !== null && !this.abortController.signal.aborted) {
+      this.abortController.abort();
+    }
+    for (const client of this.activeClients) {
+      client.end(true);
+    }
+    this.activeClients.clear();
+    this.inFlight.clear();
+    this.snapshots.clear();
+    this.abortController = null;
+  }
+
+  async readSnapshot(printer: Printer, credentials: BambuMqttResolvedCredentials): Promise<BambuMqttSnapshot> {
+    this.start();
+    const controller = this.abortController;
+    if (controller === null) {
+      throw new Error('Bambu MQTT connection server is not running');
+    }
+    const key = bambuMqttSnapshotCacheKey(printer, credentials);
+    const nowMs = this.now();
+    const cached = this.snapshots.get(key);
+    if (cached !== undefined && nowMs - cached.fetched_at_ms <= this.cacheTtlMs) {
+      return cloneBambuMqttSnapshot(cached.snapshot);
+    }
+
+    const existing = this.inFlight.get(key);
+    if (existing !== undefined) {
+      return cloneBambuMqttSnapshot(await existing);
+    }
+
+    const request = this.fetchSnapshot(key, printer, credentials, controller);
+    this.inFlight.set(key, request);
+    try {
+      return cloneBambuMqttSnapshot(await request);
+    } finally {
+      if (this.inFlight.get(key) === request) {
+        this.inFlight.delete(key);
+      }
+    }
+  }
+
+  private async fetchSnapshot(key: string, printer: Printer, credentials: BambuMqttResolvedCredentials, controller: AbortController): Promise<BambuMqttSnapshot> {
+    try {
+      const options = createBambuMqttReadOptions(printer, credentials, this.connectTimeoutMs, this.snapshotTimeoutMs, this.mqttFactory);
+      options.abort_signal = controller.signal;
+      options.on_client_ready = (client) => {
+        this.activeClients.add(client);
+      };
+      options.on_client_closed = (client) => {
+        this.activeClients.delete(client);
+      };
+      const report = await readOneBambuMqttReport(options);
+      const snapshot: BambuMqttSnapshot = {
+        slots: extractBambuObservedSlots(report),
+        error: null,
+        received_at: new Date(this.now()).toISOString()
+      };
+      this.snapshots.set(key, { fetched_at_ms: this.now(), snapshot: cloneBambuMqttSnapshot(snapshot) });
+      return snapshot;
+    } catch (error) {
+      return {
+        slots: [],
+        error: error instanceof Error ? error.message : 'Bambu LAN MQTT observation failed',
+        received_at: new Date(this.now()).toISOString()
+      };
+    }
+  }
+}
+
+
+export type BambuMqttReadOptions = BambuMqttResolvedCredentials & {
   host: string;
   connect_timeout_ms: number;
   snapshot_timeout_ms: number;
   mqtt_factory?: BambuMqttFactory;
+  abort_signal?: AbortSignal;
+  on_client_ready?: (client: BambuMqttClientLike) => void;
+  on_client_closed?: (client: BambuMqttClientLike) => void;
 };
 
+function createBambuMqttReadOptions(
+  printer: Printer,
+  credentials: BambuMqttResolvedCredentials,
+  connectTimeoutMs: number,
+  snapshotTimeoutMs: number,
+  mqttFactory: BambuMqttFactory | undefined
+): BambuMqttReadOptions {
+  const options: BambuMqttReadOptions = {
+    host: printer.host,
+    device_id: credentials.device_id,
+    lan_access_code: credentials.lan_access_code,
+    allow_insecure_tls: credentials.allow_insecure_tls === true,
+    connect_timeout_ms: connectTimeoutMs,
+    snapshot_timeout_ms: snapshotTimeoutMs
+  };
+  if (mqttFactory !== undefined) {
+    options.mqtt_factory = mqttFactory;
+  }
+  return options;
+}
+
+function cloneBambuMqttSnapshot(snapshot: BambuMqttSnapshot): BambuMqttSnapshot {
+  return {
+    slots: snapshot.slots.map((slot) => ({ ...slot })),
+    error: snapshot.error,
+    received_at: snapshot.received_at
+  };
+}
+
+function bambuMqttSnapshotCacheKey(printer: Printer, credentials: BambuMqttResolvedCredentials): string {
+  const accessCodeHash = createHash('sha256').update(credentials.lan_access_code).digest('hex').slice(0, 16);
+  return [printer.id, printer.host, credentials.device_id, credentials.allow_insecure_tls === true ? 'insecure-tls' : 'verified-tls', accessCodeHash].join('\0');
+}
+
 export async function readOneBambuMqttReport(options: BambuMqttReadOptions): Promise<Record<string, unknown>> {
+  if (options.abort_signal?.aborted) {
+    throw new Error('Bambu LAN MQTT observation aborted');
+  }
+
   const factory = options.mqtt_factory ?? await loadMqttFactory();
   const reportTopic = `device/${options.device_id}/report`;
   const requestTopic = `device/${options.device_id}/request`;
@@ -309,28 +473,52 @@ export async function readOneBambuMqttReport(options: BambuMqttReadOptions): Pro
     rejectUnauthorized: options.allow_insecure_tls !== true,
     servername: options.device_id
   });
+  options.on_client_ready?.(client);
 
   return new Promise((resolve, reject) => {
     let settled = false;
     let requestedPushAll = false;
+    let clientClosed = false;
     let snapshot: Record<string, unknown> = {};
     let noSnapshotTimer: ReturnType<typeof setTimeout> | undefined;
     const deadlineTimer = setTimeout(() => finishReject(new Error('timed out waiting for Bambu LAN MQTT report')), options.snapshot_timeout_ms);
+    const abortListener = () => finishReject(new Error('Bambu LAN MQTT observation aborted'));
+
+    const closeClient = (callback: () => void) => {
+      if (clientClosed) {
+        callback();
+        return;
+      }
+      clientClosed = true;
+      options.abort_signal?.removeEventListener('abort', abortListener);
+      client.end(true, () => {
+        options.on_client_closed?.(client);
+        callback();
+      });
+    };
 
     const finishResolve = (value: Record<string, unknown>) => {
       if (settled) return;
       settled = true;
       clearTimeout(deadlineTimer);
       if (noSnapshotTimer !== undefined) clearTimeout(noSnapshotTimer);
-      client.end(true, () => resolve(value));
+      closeClient(() => resolve(value));
     };
     const finishReject = (error: Error) => {
       if (settled) return;
       settled = true;
       clearTimeout(deadlineTimer);
       if (noSnapshotTimer !== undefined) clearTimeout(noSnapshotTimer);
-      client.end(true, () => reject(error));
+      closeClient(() => reject(error));
     };
+
+    if (options.abort_signal !== undefined) {
+      if (options.abort_signal.aborted) {
+        finishReject(new Error('Bambu LAN MQTT observation aborted'));
+        return;
+      }
+      options.abort_signal.addEventListener('abort', abortListener, { once: true });
+    }
 
     client.on('error', finishReject);
     client.on('message', (topic, payload) => {

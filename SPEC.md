@@ -22,6 +22,8 @@ Bambu integration is an AMS companion sync layer. The system observes Bambu prin
 - Track Bambu AMS slot state and create pending usage events from print-job telemetry when available.
 - Keep catalog data local by default, including brands, materials, colors, print settings, drying notes, and slicer preset alignment.
 - Deploy on a home LAN with Docker Compose, with private remote access through Tailscale or a similar VPN-style network.
+- Provide printable QR/barcode labels and short human-readable spool codes as a non-NFC fallback for fast identification and slot assignment.
+- Warn users when a mapped spool appears to have insufficient remaining filament for an estimated job, while keeping print start/control outside v1.
 
 ## 3. Non-Goals
 
@@ -52,16 +54,31 @@ A home or small-shop Bambu printer owner with one or more Bambu printers, AMS un
 10. Review pending printer-derived usage events after completed jobs.
 11. Approve, edit, or reject usage events before they affect remaining weight.
 
+
+### 4.3 Adjacent-App Feature Review
+
+Reviewed adjacent products point to several useful, boundary-safe additions:
+
+- Spoolman emphasizes a self-hosted central inventory with REST integrations, WebSocket-style live updates, QR labels, custom fields, multi-printer usage updates, and Prometheus monitoring (https://github.com/Donkie/Spoolman).
+- OctoPrint filament plugins commonly track extruded filament, warn when selected spools do not have enough material, pause on runout, apply spool temperature offsets, and support import/export or shared databases (https://github.com/OllisGit/OctoPrint-FilamentManager).
+- Bambu Studio and Bambu Handy provide slicer/profile alignment, remote monitoring/control, official filament palettes, AMS filament management, and automatic AMS enrollment; FilamentBridge should only observe compatible local state and must not replicate official control or RFID behavior (https://github.com/bambulab/BambuStudio, https://apps.apple.com/us/app/bambu-handy/id1625671285).
+- OrcaSlicer exposes filament profile fields and calibration workflows such as temperature, flow ratio, pressure advance, max volumetric speed, density, shrinkage, price, soluble/support material flags, and nozzle requirements (https://www.orcaslicer.com/wiki/material_settings/filament/material_basic_information, https://www.orcaslicer.com/wiki/calibration_guide).
+- SimplyPrint shows strong physical-inventory workflows: short spool IDs, QR/barcode label templates, mobile label generation, scan-to-assign flows, low-filament warnings, print history/cost attribution, Bambu AMS material syncing, and NFC assignment that can link a tag UID without rewriting the tag (https://help.simplyprint.io/en/article/the-filament-label-generator-feature-organize-your-filament-inventory-fh6shk/, https://help.simplyprint.io/en/article/assigning-filament-spools-to-printers-1r66t1p/).
+- OpenPrintTag highlights offline, rewritable, open smart-spool data as a safe future interoperability direction for app-owned tags; v1 may read compatible open tags for import, but must not write proprietary Bambu-compatible RFID payloads (https://openprinttag.org/).
+
+V1 should adopt only the features that reinforce FilamentBridge's local-first inventory purpose: local labels, richer filament profile metadata, scan-assisted assignment, low-filament review warnings, cost/history metadata, and observable fleet health. It must not add cloud dependency, remote print control, camera streaming, official Bambu RFID cloning, or firmware bypass behavior.
+
 ## 5. Architecture
 
 ### 5.1 Required Components
 
-- **Self-hosted server:** Owns all authoritative data, exposes API, handles sync, stores events, signs app-owned NFC payloads, and connects to printers.
+- **Self-hosted server:** Owns all authoritative data, exposes API, handles sync, stores events, signs app-owned NFC payloads, and runs the printer connection services.
 - **Database:** Stores users, devices, spool inventory, catalog records, tag assignments, printer state, slot state, and event history.
 - **Web UI:** Runs against the local server and provides inventory, catalog, printer setup, review, and settings screens.
 - **iOS app:** Provides NFC read/write, offline scan queue, spool lookup, manual weight events, and mobile pairing.
-- **Bambu connector:** Observes Bambu printer and AMS state on the LAN where supported, using local access credentials provided by the user.
+- **Bambu connector:** Observes Bambu printer and AMS state on the LAN where supported, using local access credentials provided by the user and the lightweight MQTT connection server.
 - **Background workers:** Poll or subscribe to printer state, reconcile sync queues, create pending usage events, and maintain printer health state.
+- **Lightweight MQTT connection server:** Runs inside the self-hosted server or worker process, owns Bambu LAN MQTT sessions, coalesces concurrent snapshot requests, and keeps only short-lived sanitized printer snapshots.
 
 ### 5.2 Optional Later Components
 
@@ -107,7 +124,11 @@ Required fields:
 - `status`: `sealed`, `active`, `loaded`, `drying`, `empty`, `retired`, `lost`
 - `storage_location`
 - `notes`
+- `short_code`: unique local human-readable identifier for labels and manual lookup
 - `active_tag_id`
+- `purchase_price_amount`
+- `purchase_currency`
+- `vendor_lot`
 
 Behavior:
 
@@ -139,6 +160,15 @@ Required fields:
 - `orca_slicer_preset_name`
 - `vendor_sku`
 - `notes`
+- `max_volumetric_speed_mm3_s`
+- `flow_ratio`
+- `pressure_advance`
+- `shrinkage_xy_percent`
+- `shrinkage_z_percent`
+- `softening_temp_c`
+- `required_nozzle_hrc`
+- `soluble`
+- `support_material`
 
 Behavior:
 
@@ -169,6 +199,8 @@ Behavior:
 - Store a salted hash of hardware UID by default; raw UID storage must be optional and disabled unless needed for a reader implementation.
 - Tags written by FilamentBridge must include an instance identifier and self-issued signature/check value.
 - Foreign tags may be read for best-effort import, but must not be overwritten without explicit user action.
+
+- Reading open, non-Bambu smart-spool standards may prefill local catalog or spool records, but official Bambu RFID data must remain printer-observed context only.
 
 ### 6.4 Printer
 
@@ -218,6 +250,7 @@ Behavior:
 - Detected slot data is observational.
 - User mapping wins over inferred mapping.
 - If printer-reported material conflicts with mapped spool data, create a review warning rather than silently changing the spool.
+- Scan-assisted mapping may use app-owned NFC tags, local QR/barcode labels, or manual short-code entry, but every slot mapping must remain user-confirmed.
 
 ### 6.6 SyncEvent
 
@@ -306,6 +339,34 @@ Behavior:
 - Mobile devices must pair through a local server flow before syncing.
 - Revoked devices must not submit new sync events.
 
+
+### 6.10 LabelTemplate
+
+Represents a local printable QR/barcode label layout for physical spool identification.
+
+Required fields:
+
+- `id`
+- `name`
+- `medium`: `sheet`, `roll`, `thermal`, `custom`
+- `page_width_mm`
+- `page_height_mm`
+- `label_width_mm`
+- `label_height_mm`
+- `rows`
+- `columns`
+- `code_type`: `qr`, `barcode`, `none`
+- `template_text`
+- `included_fields`
+- `created_by_user_id`
+- `last_used_at`
+
+Behavior:
+
+- Labels must encode only FilamentBridge local URLs, local spool IDs, or short codes.
+- Label generation must work without an internet service.
+- QR/barcode labels are identification aids, not trusted authentication; NFC signatures remain the trusted app-owned tag mechanism.
+
 ## 7. NFC Tag Specification
 
 ### 7.1 Tag Class
@@ -388,7 +449,9 @@ The v1 connector should support local network registration with:
 
 The connector may use locally available protocols exposed by Bambu printers where supported. Because Bambu firmware and local-access behavior can change, the connector must be capability-driven and fail gracefully.
 
-FilamentBridge does not run an MQTT broker. LAN and VPN-LAN modes connect directly to the configured printer host on port 8883, and the MQTT device ID/serial is the topic identifier used for `device/<id>/report` and `device/<id>/request`.
+FilamentBridge runs a lightweight MQTT connection server for Bambu LAN and VPN-LAN modes. This service is not a general-purpose MQTT broker and must not expose an unauthenticated public MQTT listener; it owns outbound TLS MQTT client sessions to the configured printer host on port 8883, subscribes only to the exact `device/<id>/report` topic, and publishes only the safe observational `device/<id>/request` push-all request when a snapshot is needed.
+
+The MQTT connection server should coalesce concurrent requests for the same printer, cache successful sanitized snapshots only briefly, clear in-flight sessions on shutdown, and surface connection errors as printer telemetry warnings instead of blocking normal inventory or NFC workflows.
 
 ### 8.3 Compatibility Matrix
 
@@ -438,6 +501,7 @@ When a completed job can be associated with a slot and estimated filament usage:
 3. Include printer, slot, mapped spool, estimated weight delta, and confidence.
 4. Show the event in the web UI and mobile app review queue.
 5. Apply it to spool remaining weight only after approval, edit, or configured auto-approval.
+6. If estimated remaining filament is below the job estimate, show an explicit low-filament warning before approval or auto-approval.
 
 If the job uses multiple slots, create one usage event per spool where usage can be separated. If usage cannot be separated, create one review item with a conflict warning.
 
@@ -450,6 +514,7 @@ FilamentBridge must include this boundary in user-facing settings and developer 
 - The app must not generate tags intended to pass as official Bambu filament.
 - The app must not instruct users to bypass Bambu signatures or firmware checks.
 
+- Open smart-spool tag formats may be read or written only for app-owned/non-Bambu tags and only when the format does not claim official Bambu authenticity.
 ## 9. API Surface
 
 The API may be REST, GraphQL, RPC, or a hybrid, but it must support the following behavior. Endpoint names below are normative if REST is chosen.
@@ -548,6 +613,21 @@ Requirements:
 
 - Approval must update spool remaining weight atomically.
 - Rejected and edited events remain in history.
+- Events should expose estimated material cost when spool purchase price is available, without making cost required for weight accounting.
+
+### 9.7 Labels And Lookup
+
+- `GET /api/labels/templates`
+- `POST /api/labels/templates`
+- `PATCH /api/labels/templates/{id}`
+- `POST /api/labels/render`
+- `GET /api/spools/lookup?code={short_code_or_label_code}`
+
+Requirements:
+
+- Rendered labels must support at least QR codes and human-readable short codes.
+- Label rendering must not call a cloud service.
+- Lookup by short code or label code must require authentication and return the same spool authorization checks as `GET /api/spools/{id}`.
 
 ## 10. Sync And Conflict Rules
 
@@ -589,6 +669,7 @@ Required screens:
 - AMS/slot mapping view.
 - Usage event review queue.
 - NFC tag audit view.
+- Label template and print/export view.
 - Backup/export settings.
 - Security and device settings.
 
@@ -614,6 +695,8 @@ Required NFC states:
 - Invalid signature/check detected.
 - Write succeeded.
 - Write failed.
+- QR/barcode label scan found a spool.
+- QR/barcode label scan did not match any active spool.
 
 ## 12. Deployment And Operations
 
@@ -637,6 +720,7 @@ Required configuration:
 - Secret key material location.
 - Backup location.
 - Printer connector enabled/disabled.
+- MQTT connection server enabled/disabled with the printer connector.
 - Allowed origins for web and mobile clients.
 
 ### 12.3 Backup And Restore
@@ -682,6 +766,7 @@ Required:
 
 - Store Bambu Studio and Orca preset names on catalog items.
 - Import and export catalog data in a documented local format.
+- Store flow ratio, pressure advance, max volumetric speed, shrinkage, support/soluble flags, and nozzle requirement metadata when users maintain those values locally.
 - Allow users to manually copy preset names and material settings.
 
 Later:
@@ -689,6 +774,7 @@ Later:
 - Parse slicer preset files.
 - Export presets directly.
 - Import job metadata for usage review.
+- Import/export calibration-relevant filament profile metadata where the format is documented and locally accessible.
 - Match printed job material assignments to spool records with higher confidence.
 
 ## 15. Acceptance Tests
@@ -730,6 +816,7 @@ Later:
 - Detect a completed job where telemetry is available.
 - Create a pending usage event.
 - Approve the usage event and update remaining spool weight.
+- Warn before approval or auto-approval when estimated usage exceeds the mapped spool's remaining weight.
 
 ### 15.5 Boundary Tests
 
@@ -737,6 +824,7 @@ Later:
 - Confirm documentation states that Bambu RFID cloning/forging is out of scope.
 - Confirm app-owned NFC tags remain separate companion tags.
 - Confirm printer telemetry failures do not block normal inventory and NFC workflows.
+- Confirm QR/barcode labels identify local spools but do not authenticate app-owned NFC payloads.
 
 ### 15.6 Deployment
 
@@ -787,9 +875,20 @@ Official and primary references:
 - Bambu Lab H2S official store page: https://us.store.bambulab.com/products/h2s
 - Bambu Lab X2D announcement: https://blog.bambulab.com/xcellence-made-simple-bambu-lab-presents-the-x2d/
 
+- Bambu Handy App Store listing: https://apps.apple.com/us/app/bambu-handy/id1625671285
+
 Unofficial implementation and research references:
 
 - PrintHQ Bambu LAN notes: https://printhq.io/docs/printers/bambu-lab
 - Bambu RFID Tag Guide: https://github.com/Bambu-Research-Group/RFID-Tag-Guide
+- Spoolman: https://github.com/Donkie/Spoolman
+- OctoPrint-FilamentManager: https://github.com/OllisGit/OctoPrint-FilamentManager
+- SimplyPrint label generator: https://help.simplyprint.io/en/article/the-filament-label-generator-feature-organize-your-filament-inventory-fh6shk/
+- SimplyPrint spool assignment: https://help.simplyprint.io/en/article/assigning-filament-spools-to-printers-1r66t1p/
+- OpenPrintTag: https://openprinttag.org/
+- Bambu Studio: https://github.com/bambulab/BambuStudio
+- OrcaSlicer: https://github.com/OrcaSlicer/OrcaSlicer
+- OrcaSlicer material settings: https://www.orcaslicer.com/wiki/material_settings/filament/material_basic_information
+- OrcaSlicer calibration guide: https://www.orcaslicer.com/wiki/calibration_guide
 
 Unofficial references are useful for feasibility research, but they are not vendor contracts. Any implementation based on them must be capability-gated, tested against real hardware, and documented as best-effort.

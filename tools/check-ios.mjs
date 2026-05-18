@@ -16,7 +16,7 @@ for (const file of requiredFiles) {
 
 const app = readFileSync('apps/ios/Sources/FilamentBridgeIOS/FilamentBridgeApp.swift', 'utf8');
 const nfc = readFileSync('apps/ios/Sources/FilamentBridgeIOS/NFCService.swift', 'utf8');
-for (const label of ['Server pairing', 'Scan tag', 'Assign blank tag', 'Spool summary', 'Manual weight adjustment', 'Rewrite stale tag', 'Offline queue', 'Conflict review']) {
+for (const label of ['Server pairing', 'Scan tag', 'Scan label', 'Assign blank tag', 'Spool summary', 'Manual weight adjustment', 'Rewrite stale tag', 'Offline queue', 'Conflict review']) {
   if (!app.includes(label)) throw new Error(`missing iOS screen: ${label}`);
 }
 for (const token of ['import CoreNFC', 'NFCTagReaderSession', '0xA2', 'NTAG213-compatible NFC Forum Type 2 companion tags']) {

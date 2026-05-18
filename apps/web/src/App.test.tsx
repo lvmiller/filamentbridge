@@ -27,7 +27,7 @@ describe('FilamentBridge web UI', () => {
     }));
     render(<App />);
     await waitFor(() => expect(screen.getByRole('button', { name: 'Dashboard' })).toBeInTheDocument());
-    for (const label of ['Inventory', 'Catalog', 'Spool detail', 'Printer setup', 'Usage review', 'NFC audit', 'Backup/export', 'Security/devices']) {
+    for (const label of ['Inventory', 'Catalog', 'Spool detail', 'Printer setup', 'Usage review', 'NFC audit', 'Labels', 'Backup/export', 'Security/devices']) {
       expect(screen.getByRole('button', { name: label })).toBeInTheDocument();
     }
     expect(screen.getByText(/does not clone, forge, emulate/i)).toBeInTheDocument();
@@ -75,6 +75,7 @@ describe('FilamentBridge web UI', () => {
       if (url.endsWith('/api/printers/p1/slots')) return json([]);
       if (url.endsWith('/api/usage-events')) return json([]);
       if (url.endsWith('/api/devices')) return json([]);
+      if (url.endsWith('/api/labels/templates')) return json([]);
       return json([]);
     }));
 
@@ -93,10 +94,38 @@ describe('FilamentBridge web UI', () => {
     await waitFor(() => expect(posts).toContain('/api/catalog-items/c1/delete'));
 
     fireEvent.click(screen.getByRole('button', { name: 'Printer setup' }));
-    expect(await screen.findByText(/does not run an MQTT broker in Docker/i)).toBeInTheDocument();
+    expect(await screen.findByText(/internal lightweight MQTT connection service/i)).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: 'Remove printer' }));
     await waitFor(() => expect(posts).toContain('/api/printers/p1/delete'));
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Remove printer' })).not.toBeInTheDocument());
+  });
+
+  it('renders local spool labels from label templates', async () => {
+    window.localStorage.setItem('fb_token', 'token');
+    const now = new Date().toISOString();
+    const template = { id: 'lt1', name: 'QR labels', medium: 'sheet', page_width_mm: 210, page_height_mm: 297, label_width_mm: 70, label_height_mm: 35, rows: 8, columns: 2, code_type: 'qr', template_text: '{{display_name}}', included_fields: ['short_code'], created_by_user_id: 'u1', last_used_at: null, created_at: now, updated_at: now, deleted_at: null, version: 1 };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (method === 'POST' && url.endsWith('/api/labels/render')) return json({ mime_type: 'image/svg+xml', filename: 'qr-labels.svg', svg: '<svg><text>PLA-BLUE-1</text></svg>' });
+      if (url.endsWith('/api/setup/status')) return json({ configured: true, instance_id: 'fb_test', boundary: 'boundary' });
+      if (url.endsWith('/api/auth/me')) return json(fixtureFor(url));
+      if (url.endsWith('/api/catalog-items')) return json([catalogFixture(now)]);
+      if (url.endsWith('/api/spools')) return json([spoolFixture(now)]);
+      if (url.endsWith('/api/nfc/tags')) return json([]);
+      if (url.endsWith('/api/printers')) return json([]);
+      if (url.endsWith('/api/usage-events')) return json([]);
+      if (url.endsWith('/api/devices')) return json([]);
+      if (url.endsWith('/api/labels/templates')) return json([template]);
+      return json([]);
+    }));
+
+    render(<App />);
+    await screen.findByRole('button', { name: 'Labels' });
+    fireEvent.click(screen.getByRole('button', { name: 'Labels' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Render label SVG' }));
+    expect(await screen.findByText('qr-labels.svg')).toBeInTheDocument();
+    expect(screen.getAllByDisplayValue(/PLA-BLUE-1/).length).toBeGreaterThan(0);
   });
 });
 
@@ -110,6 +139,7 @@ function fixtureFor(url: string): unknown {
   if (url.endsWith('/api/printers/p1/slots')) return [];
   if (url.endsWith('/api/usage-events')) return [];
   if (url.endsWith('/api/devices')) return [];
+  if (url.endsWith('/api/labels/templates')) return [];
   return [];
 }
 
@@ -118,11 +148,11 @@ function json(data: unknown): Response {
 }
 
 function catalogFixture(now: string): EntityFixture {
-  return { id: 'c1', brand: 'Bambu Lab', product_line: 'PLA Basic', material_type: 'PLA', diameter_mm: 1.75, color_name: 'Blue', color_hex: '#1e88e5', nozzle_temp_min_c: 190, nozzle_temp_max_c: 230, bed_temp_min_c: 35, bed_temp_max_c: 60, drying_temp_c: 45, drying_time_minutes: 240, density_g_cm3: 1.24, bambu_studio_preset_name: 'Bambu PLA Basic', orca_slicer_preset_name: 'Bambu PLA Basic', vendor_sku: null, notes: null, created_at: now, updated_at: now, deleted_at: null, version: 1 };
+  return { id: 'c1', brand: 'Bambu Lab', product_line: 'PLA Basic', material_type: 'PLA', diameter_mm: 1.75, color_name: 'Blue', color_hex: '#1e88e5', nozzle_temp_min_c: 190, nozzle_temp_max_c: 230, bed_temp_min_c: 35, bed_temp_max_c: 60, drying_temp_c: 45, drying_time_minutes: 240, density_g_cm3: 1.24, bambu_studio_preset_name: 'Bambu PLA Basic', orca_slicer_preset_name: 'Bambu PLA Basic', vendor_sku: null, max_volumetric_speed_mm3_s: null, flow_ratio: null, pressure_advance: null, shrinkage_xy_percent: null, shrinkage_z_percent: null, softening_temp_c: null, required_nozzle_hrc: null, soluble: null, support_material: null, notes: null, created_at: now, updated_at: now, deleted_at: null, version: 1 };
 }
 
 function spoolFixture(now: string): EntityFixture {
-  return { id: 's1', catalog_item_id: 'c1', display_name: 'Blue PLA', manufacturer_name: 'Bambu Lab', material_type: 'PLA', diameter_mm: 1.75, color_hex: '#1e88e5', initial_filament_weight_g: 1000, remaining_filament_weight_g: 1000, empty_spool_weight_g: 250, purchase_date: null, opened_at: null, status: 'sealed', storage_location: 'Shelf', notes: null, active_tag_id: null, created_at: now, updated_at: now, deleted_at: null, version: 1 };
+  return { id: 's1', catalog_item_id: 'c1', display_name: 'Blue PLA', manufacturer_name: 'Bambu Lab', material_type: 'PLA', diameter_mm: 1.75, color_hex: '#1e88e5', initial_filament_weight_g: 1000, remaining_filament_weight_g: 1000, empty_spool_weight_g: 250, purchase_date: null, opened_at: null, status: 'sealed', storage_location: 'Shelf', notes: null, short_code: 'PLA-BLUE-1', purchase_price_amount: null, purchase_currency: null, vendor_lot: null, active_tag_id: null, created_at: now, updated_at: now, deleted_at: null, version: 1 };
 }
 
 function printerFixture(now: string): EntityFixture {

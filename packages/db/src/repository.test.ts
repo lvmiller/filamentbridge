@@ -13,6 +13,24 @@ describe('FilamentBridgeRepository', () => {
     repo.close();
   });
 
+  it('manages short-code labels and cost-aware low-filament warnings', () => {
+    const repo = openFilamentBridgeDatabase({ path: ':memory:' });
+    repo.setInstanceId('fb_labels');
+    const user = repo.createUser({ email: 'owner@example.local', display_name: 'Owner', password_hash: 'hash' });
+    const { spool } = seedDemoData(repo);
+    const priced = repo.updateSpool(spool.id, { expected_version: spool.version, purchase_price_amount: 30, purchase_currency: 'USD', vendor_lot: 'LOT-42', short_code: 'pla-blue-1' });
+    expect(repo.getSpoolByCode('PLA-BLUE-1').id).toBe(priced.id);
+    const template = repo.createLabelTemplate({ name: 'QR labels', medium: 'sheet', page_width_mm: 210, page_height_mm: 297, label_width_mm: 70, label_height_mm: 35, rows: 8, columns: 2, code_type: 'qr', template_text: '{{display_name}}', included_fields: ['short_code'], created_by_user_id: user.id });
+    expect(repo.listLabelTemplates()[0]?.included_fields).toEqual(['short_code']);
+    const event = repo.createPendingUsageEvent({ spool_id: priced.id, source: 'printer_job', printer_id: null, printer_slot_id: null, job_id: 'job-1', delta_weight_g: -2000, confidence: 'estimated', review_status: 'pending', notes: null });
+    expect(event.after_weight_g).toBe(0);
+    expect(event.notes).toMatch(/exceeds remaining spool weight/);
+    expect(event.estimated_material_cost_amount).toBe(60);
+    repo.touchLabelTemplateUsed(template.id);
+    expect(repo.getLabelTemplate(template.id).last_used_at).not.toBeNull();
+    repo.close();
+  });
+
   it('keeps one active NFC tag and retires historical tags for audit', () => {
     const repo = openFilamentBridgeDatabase({ path: ':memory:' });
     repo.setInstanceId('fb_test');

@@ -61,6 +61,7 @@ struct Spool: Codable, Equatable, Identifiable {
     var version: Int
     var status: String
     var activeTagId: String?
+    var shortCode: String?
 
     enum CodingKeys: String, CodingKey {
         case id, version, status
@@ -69,6 +70,7 @@ struct Spool: Codable, Equatable, Identifiable {
         case colorHex = "color_hex"
         case remainingFilamentWeightG = "remaining_filament_weight_g"
         case activeTagId = "active_tag_id"
+        case shortCode = "short_code"
     }
 }
 

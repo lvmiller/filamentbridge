@@ -29,6 +29,10 @@ final class FilamentBridgeAPIClient: ObservableObject {
 
     func spools() async throws -> [Spool] { try await get("/api/spools") }
 
+    func lookupSpool(code: String) async throws -> Spool {
+        try await get("/api/spools/lookup?code=\(code.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? code)")
+    }
+
     func assignTag(spool: Spool, tagUid: String) async throws -> NfcTag {
         struct AssignResponse: Decodable { var tag: NfcTag; var spool: Spool }
         let response: AssignResponse = try await post("/api/nfc/assign", body: ["spool_id": spool.id, "tag_uid": tagUid, "expected_spool_version": spool.version] as [String : Any])

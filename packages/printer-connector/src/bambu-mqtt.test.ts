@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   BambuLanMqttConnector,
+  BambuMqttConnectionServer,
   createBambuPushAllRequest,
   deepMergeBambuReport,
   extractBambuObservedSlots,
@@ -233,3 +234,112 @@ describe('BambuLanMqttConnector', () => {
     expect(JSON.parse(publications[0]?.payload ?? '{}')).toMatchObject({ pushing: { command: 'pushall' } });
   });
 });
+
+describe('BambuMqttConnectionServer', () => {
+  it('coalesces concurrent connector snapshots and serves a short cache', async () => {
+    let now = 1_700_000_000_000;
+    let factoryCalls = 0;
+    const reportTopic = 'device/DEV123/report';
+    const server = new BambuMqttConnectionServer({
+      snapshot_timeout_ms: 20,
+      cache_ttl_ms: 1000,
+      now: () => now,
+      mqtt_factory: () => {
+        factoryCalls += 1;
+        const handlers: Record<string, (...args: never[]) => void> = {};
+        setTimeout(() => handlers.connect?.(), 0);
+        const client: BambuMqttClientLike = {
+          on(event: 'connect' | 'message' | 'error', listener: (() => void) | ((topic: string, payload: Uint8Array | Buffer | string) => void) | ((error: Error) => void)) {
+            handlers[event] = listener as (...args: never[]) => void;
+            return client;
+          },
+          subscribe(_topic: string, callback: (error?: Error | null) => void) {
+            callback(null);
+          },
+          publish(_topic: string, _payload: string, callback?: (error?: Error | null) => void) {
+            handlers.message?.(reportTopic as never, Buffer.from(JSON.stringify({ print: { ams: { ams: [{ id: '0', tray: [{ id: '0', tray_type: 'PLA', tray_color: 'FFFFFF00' }] }] } } })) as never);
+            callback?.(null);
+          },
+          end(_force?: boolean, callback?: () => void) {
+            callback?.();
+          }
+        };
+        return client;
+      }
+    });
+    const connector = new BambuLanMqttConnector({
+      resolveCredentials: () => ({ lan_access_code: '12345678', device_id: 'DEV123' }),
+      snapshot_source: server
+    });
+    await connector.start?.();
+
+    const printer = lanPrinter();
+    const [first, second] = await Promise.all([
+      connector.syncNow(printer, []),
+      connector.syncNow(printer, [])
+    ]);
+    expect(first.observed_slots).toHaveLength(1);
+    expect(second.observed_slots).toHaveLength(1);
+    expect(factoryCalls).toBe(1);
+
+    first.observed_slots[0]!.display_name = 'mutated';
+    const cached = await connector.syncNow(printer, []);
+    expect(cached.observed_slots[0]?.display_name).toBe('AMS 1 Slot 1');
+    expect(factoryCalls).toBe(1);
+
+    now += 1001;
+    await connector.syncNow(printer, []);
+    expect(factoryCalls).toBe(2);
+    await connector.stop?.();
+  });
+
+  it('stops active MQTT clients and reports aborted snapshots', async () => {
+    let endCalls = 0;
+    const server = new BambuMqttConnectionServer({
+      snapshot_timeout_ms: 1000,
+      mqtt_factory: () => {
+        const client: BambuMqttClientLike = {
+          on() {
+            return client;
+          },
+          subscribe() {},
+          publish() {},
+          end(_force?: boolean, callback?: () => void) {
+            endCalls += 1;
+            callback?.();
+          }
+        };
+        return client;
+      }
+    });
+
+    const snapshotRequest = server.readSnapshot(lanPrinter(), { lan_access_code: '12345678', device_id: 'DEV123' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    server.stop();
+    const snapshot = await snapshotRequest;
+
+    expect(snapshot.error).toMatch(/aborted/);
+    expect(endCalls).toBeGreaterThan(0);
+  });
+});
+
+function lanPrinter() {
+  return {
+    id: 'printer-1',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    deleted_at: null,
+    version: 1,
+    name: 'P1S',
+    manufacturer: 'Bambu Lab' as const,
+    model: 'P1S',
+    serial_hash: '0123456789abcdef',
+    host: '192.168.1.50',
+    lan_access_code_secret_ref: null,
+    connection_mode: 'lan' as const,
+    capability_level: 'manual_only' as const,
+    last_seen_at: null,
+    firmware_version: null,
+    notes: null
+  };
+}

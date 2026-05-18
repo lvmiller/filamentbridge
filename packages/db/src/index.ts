@@ -12,6 +12,7 @@ import {
   type DeviceType,
   type FilamentBridgeExport,
   type FilamentCatalogItem,
+  type LabelTemplate,
   type NfcTag,
   type NfcTagStatus,
   type Printer,
@@ -76,10 +77,12 @@ export type CreateUserRecord = {
   role?: 'owner' | 'admin' | 'operator' | 'viewer';
 };
 
-export type CreateCatalogRecord = Omit<FilamentCatalogItem, 'id' | 'created_at' | 'updated_at' | 'deleted_at' | 'version'>;
+export type CreateCatalogRecord = Omit<FilamentCatalogItem, 'id' | 'created_at' | 'updated_at' | 'deleted_at' | 'version' | 'max_volumetric_speed_mm3_s' | 'flow_ratio' | 'pressure_advance' | 'shrinkage_xy_percent' | 'shrinkage_z_percent' | 'softening_temp_c' | 'required_nozzle_hrc' | 'soluble' | 'support_material'> & Partial<Pick<FilamentCatalogItem, 'max_volumetric_speed_mm3_s' | 'flow_ratio' | 'pressure_advance' | 'shrinkage_xy_percent' | 'shrinkage_z_percent' | 'softening_temp_c' | 'required_nozzle_hrc' | 'soluble' | 'support_material'>>;
 export type PatchCatalogRecord = Partial<CreateCatalogRecord> & { expected_version: number };
+export type CreateLabelTemplateRecord = Omit<LabelTemplate, 'id' | 'created_at' | 'updated_at' | 'deleted_at' | 'version' | 'last_used_at'>;
+export type PatchLabelTemplateRecord = Partial<CreateLabelTemplateRecord> & { expected_version: number };
 
-export type CreateSpoolRecord = Omit<Spool, 'id' | 'created_at' | 'updated_at' | 'deleted_at' | 'version' | 'active_tag_id'>;
+export type CreateSpoolRecord = Omit<Spool, 'id' | 'created_at' | 'updated_at' | 'deleted_at' | 'version' | 'active_tag_id' | 'short_code' | 'purchase_price_amount' | 'purchase_currency' | 'vendor_lot'> & { short_code?: string | undefined; purchase_price_amount?: number | null | undefined; purchase_currency?: string | null | undefined; vendor_lot?: string | null | undefined };
 export type PatchSpoolRecord = Partial<Omit<CreateSpoolRecord, 'remaining_filament_weight_g'>> & { expected_version: number };
 
 export type CreatePrinterRecord = {
@@ -166,8 +169,32 @@ export class FilamentBridgeRepository {
   migrate(): void {
     this.database.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;');
     this.database.exec(SCHEMA_SQL);
+    this.ensureSchemaAdditions();
     this.setMetaIfMissing('schema_version', '1');
     this.setMetaIfMissing('boundary', OFFICIAL_RFID_BOUNDARY);
+  }
+
+  private ensureSchemaAdditions(): void {
+    ensureColumn(this.database, 'catalog_items', 'max_volumetric_speed_mm3_s', 'real');
+    ensureColumn(this.database, 'catalog_items', 'flow_ratio', 'real');
+    ensureColumn(this.database, 'catalog_items', 'pressure_advance', 'real');
+    ensureColumn(this.database, 'catalog_items', 'shrinkage_xy_percent', 'real');
+    ensureColumn(this.database, 'catalog_items', 'shrinkage_z_percent', 'real');
+    ensureColumn(this.database, 'catalog_items', 'softening_temp_c', 'integer');
+    ensureColumn(this.database, 'catalog_items', 'required_nozzle_hrc', 'real');
+    ensureColumn(this.database, 'catalog_items', 'soluble', 'integer');
+    ensureColumn(this.database, 'catalog_items', 'support_material', 'integer');
+    ensureColumn(this.database, 'spools', 'short_code', 'text');
+    ensureColumn(this.database, 'spools', 'purchase_price_amount', 'real');
+    ensureColumn(this.database, 'spools', 'purchase_currency', 'text');
+    ensureColumn(this.database, 'spools', 'vendor_lot', 'text');
+    ensureColumn(this.database, 'usage_events', 'estimated_material_cost_amount', 'real');
+    ensureColumn(this.database, 'usage_events', 'estimated_material_cost_currency', 'text');
+    const missingCodes = this.database.prepare("select id from spools where short_code is null or short_code = ''").all() as Array<{ id: string }>;
+    for (const row of missingCodes) {
+      this.database.prepare('update spools set short_code = ? where id = ?').run(this.createUniqueSpoolShortCode(), row.id);
+    }
+    this.database.exec('create unique index if not exists idx_spools_short_code on spools(short_code) where short_code is not null;');
   }
 
   transaction<T>(fn: () => T): T {
@@ -338,29 +365,29 @@ export class FilamentBridgeRepository {
 
   createCatalogItem(input: CreateCatalogRecord): FilamentCatalogItem {
     const now = nowIso();
-    const item: FilamentCatalogItem = { id: randomUUID(), created_at: now, updated_at: now, deleted_at: null, version: 1, ...input };
-    this.database.prepare(CATALOG_INSERT_SQL).run(item);
+    const item: FilamentCatalogItem = { id: randomUUID(), created_at: now, updated_at: now, deleted_at: null, version: 1, max_volumetric_speed_mm3_s: null, flow_ratio: null, pressure_advance: null, shrinkage_xy_percent: null, shrinkage_z_percent: null, softening_temp_c: null, required_nozzle_hrc: null, soluble: null, support_material: null, ...input };
+    this.database.prepare(CATALOG_INSERT_SQL).run(serializeCatalogItem(item));
     return item;
   }
 
   listCatalogItems(includeDeleted = false): FilamentCatalogItem[] {
     const sql = includeDeleted ? 'select * from catalog_items order by brand, product_line, color_name' : 'select * from catalog_items where deleted_at is null order by brand, product_line, color_name';
-    return this.database.prepare(sql).all() as FilamentCatalogItem[];
+    return this.database.prepare(sql).all().map(mapCatalogItem);
   }
 
   getCatalogItem(id: string): FilamentCatalogItem {
-    const row = this.database.prepare('select * from catalog_items where id = ?').get(id) as FilamentCatalogItem | undefined;
+    const row = this.database.prepare('select * from catalog_items where id = ?').get(id);
     if (row === undefined || row.deleted_at !== null) {
       throw new RepositoryError('not_found', 'catalog item not found');
     }
-    return row;
+    return mapCatalogItem(row);
   }
 
   updateCatalogItem(id: string, patch: PatchCatalogRecord): FilamentCatalogItem {
     const current = this.getCatalogItem(id);
     assertVersion(current.version, patch.expected_version);
     const next: FilamentCatalogItem = { ...current, ...withoutExpectedVersion(patch), version: current.version + 1, updated_at: nowIso() };
-    this.database.prepare(CATALOG_UPDATE_SQL).run(next);
+    this.database.prepare(CATALOG_UPDATE_SQL).run(serializeCatalogItem(next));
     return next;
   }
 
@@ -373,7 +400,7 @@ export class FilamentBridgeRepository {
     }
     const now = nowIso();
     const next: FilamentCatalogItem = { ...current, deleted_at: now, updated_at: now, version: current.version + 1 };
-    this.database.prepare(CATALOG_UPDATE_SQL).run(next);
+    this.database.prepare(CATALOG_UPDATE_SQL).run(serializeCatalogItem(next));
     return next;
   }
 
@@ -385,28 +412,39 @@ export class FilamentBridgeRepository {
     assertSpoolWeightInvariant({ ...input, active_tag_id: null } as Spool);
     this.getCatalogItem(input.catalog_item_id);
     const now = nowIso();
-    const spool: Spool = { id: randomUUID(), created_at: now, updated_at: now, deleted_at: null, version: 1, active_tag_id: null, ...input };
+    const spool: Spool = { id: randomUUID(), created_at: now, updated_at: now, deleted_at: null, version: 1, active_tag_id: null, ...input, purchase_price_amount: input.purchase_price_amount ?? null, purchase_currency: input.purchase_currency ?? null, vendor_lot: input.vendor_lot ?? null, short_code: this.normalizeOrCreateSpoolShortCode(input.short_code) };
     this.database.prepare(SPOOL_INSERT_SQL).run(spool);
     return spool;
   }
 
   listSpools(includeDeleted = false): Spool[] {
     const sql = includeDeleted ? 'select * from spools order by updated_at desc' : 'select * from spools where deleted_at is null order by updated_at desc';
-    return this.database.prepare(sql).all() as Spool[];
+    return this.database.prepare(sql).all().map(mapSpool);
   }
 
   getSpool(id: string): Spool {
-    const row = this.database.prepare('select * from spools where id = ?').get(id) as Spool | undefined;
+    const row = this.database.prepare('select * from spools where id = ?').get(id);
     if (row === undefined || row.deleted_at !== null) {
       throw new RepositoryError('not_found', 'spool not found');
     }
-    return row;
+    return mapSpool(row);
+  }
+
+  getSpoolByCode(code: string): Spool {
+    const normalized = normalizeShortCode(code);
+    const row = this.database.prepare('select * from spools where deleted_at is null and (short_code = ? or id = ?)').get(normalized, code.trim());
+    if (row === undefined) {
+      throw new RepositoryError('not_found', 'spool not found for code');
+    }
+    return mapSpool(row);
   }
 
   updateSpool(id: string, patch: PatchSpoolRecord): Spool {
     const current = this.getSpool(id);
     assertVersion(current.version, patch.expected_version);
-    const next: Spool = { ...current, ...withoutExpectedVersion(patch), version: current.version + 1, updated_at: nowIso() };
+    const patchWithoutVersion = withoutExpectedVersion(patch);
+    const cleanPatch = stripUndefined(patchWithoutVersion);
+    const next: Spool = { ...current, ...cleanPatch, purchase_price_amount: cleanPatch.purchase_price_amount === undefined ? current.purchase_price_amount : cleanPatch.purchase_price_amount, purchase_currency: cleanPatch.purchase_currency === undefined ? current.purchase_currency : cleanPatch.purchase_currency, vendor_lot: cleanPatch.vendor_lot === undefined ? current.vendor_lot : cleanPatch.vendor_lot, short_code: cleanPatch.short_code === undefined ? current.short_code : normalizeShortCode(cleanPatch.short_code), version: current.version + 1, updated_at: nowIso() };
     assertSpoolWeightInvariant(next);
     this.database.prepare(SPOOL_UPDATE_SQL).run(next);
     return next;
@@ -461,9 +499,13 @@ export class FilamentBridgeRepository {
 
   createPendingUsageEvent(input: CreateUsageEventRecord): UsageEvent {
     const spool = this.getSpool(input.spool_id);
-    const after = Math.max(0, spool.remaining_filament_weight_g + input.delta_weight_g);
+    const rawAfter = spool.remaining_filament_weight_g + input.delta_weight_g;
+    const after = Math.max(0, rawAfter);
+    const lowFilamentWarning = rawAfter < 0 ? `Warning: estimated usage exceeds remaining spool weight by ${Math.abs(rawAfter)} g.` : null;
+    const notes = [input.notes, lowFilamentWarning].filter((value): value is string => value !== null && value.length > 0).join(' ');
     return this.insertUsageEvent({
       ...input,
+      notes: notes.length > 0 ? notes : null,
       before_weight_g: spool.remaining_filament_weight_g,
       after_weight_g: after,
       created_at: nowIso(),
@@ -715,8 +757,66 @@ export class FilamentBridgeRepository {
     return event;
   }
 
+  createLabelTemplate(input: CreateLabelTemplateRecord): LabelTemplate {
+    this.getUser(input.created_by_user_id);
+    const now = nowIso();
+    const template: LabelTemplate = { id: randomUUID(), created_at: now, updated_at: now, deleted_at: null, version: 1, last_used_at: null, ...input };
+    this.database.prepare(LABEL_TEMPLATE_INSERT_SQL).run(serializeLabelTemplate(template));
+    return template;
+  }
+
+  listLabelTemplates(includeDeleted = false): LabelTemplate[] {
+    const sql = includeDeleted ? 'select * from label_templates order by updated_at desc' : 'select * from label_templates where deleted_at is null order by updated_at desc';
+    return this.database.prepare(sql).all().map(mapLabelTemplate);
+  }
+
+  getLabelTemplate(id: string): LabelTemplate {
+    const row = this.database.prepare('select * from label_templates where id = ?').get(id);
+    if (row === undefined || row.deleted_at !== null) {
+      throw new RepositoryError('not_found', 'label template not found');
+    }
+    return mapLabelTemplate(row);
+  }
+
+  updateLabelTemplate(id: string, patch: PatchLabelTemplateRecord): LabelTemplate {
+    const current = this.getLabelTemplate(id);
+    assertVersion(current.version, patch.expected_version);
+    const next: LabelTemplate = { ...current, ...withoutExpectedVersion(patch), updated_at: nowIso(), version: current.version + 1 };
+    this.database.prepare(LABEL_TEMPLATE_UPDATE_SQL).run(serializeLabelTemplate(next));
+    return next;
+  }
+
+  touchLabelTemplateUsed(id: string): LabelTemplate {
+    const current = this.getLabelTemplate(id);
+    const now = nowIso();
+    const next: LabelTemplate = { ...current, last_used_at: now, updated_at: now, version: current.version + 1 };
+    this.database.prepare(LABEL_TEMPLATE_UPDATE_SQL).run(serializeLabelTemplate(next));
+    return next;
+  }
+
   listSyncEvents(): SyncEvent[] {
     return this.database.prepare('select * from sync_events order by created_at desc').all().map(mapSyncEvent);
+  }
+
+  private normalizeOrCreateSpoolShortCode(input: string | undefined): string {
+    if (input !== undefined) {
+      const normalized = normalizeShortCode(input);
+      const existing = this.database.prepare('select id from spools where short_code = ?').get(normalized);
+      if (existing !== undefined) {
+        throw new RepositoryError('conflict', 'spool short code already exists');
+      }
+      return normalized;
+    }
+    return this.createUniqueSpoolShortCode();
+  }
+
+  private createUniqueSpoolShortCode(): string {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const candidate = `FB-${randomUUID().replace(/-/g, '').slice(0, 8).toUpperCase()}`;
+      const existing = this.database.prepare('select id from spools where short_code = ?').get(candidate);
+      if (existing === undefined) return candidate;
+    }
+    throw new RepositoryError('conflict', 'could not allocate unique spool short code');
   }
 
   createExportSnapshot(): FilamentBridgeExport {
@@ -724,6 +824,7 @@ export class FilamentBridgeRepository {
     if (instanceId === null) {
       throw new RepositoryError('invalid_state', 'instance id is not configured');
     }
+
     return {
       format: EXPORT_FORMAT,
       exported_at: nowIso(),
@@ -733,7 +834,8 @@ export class FilamentBridgeRepository {
       nfc_tags: this.listTags(),
       printers: this.database.prepare('select * from printers order by name').all() as Printer[],
       printer_slots: this.database.prepare('select * from printer_slots order by printer_id, unit_index, slot_index').all() as PrinterSlot[],
-      usage_events: this.listUsageEvents()
+      usage_events: this.listUsageEvents(),
+      label_templates: this.listLabelTemplates(true)
     };
   }
 
@@ -742,14 +844,15 @@ export class FilamentBridgeRepository {
       throw new RepositoryError('invalid_state', 'unsupported export format');
     }
     this.transaction(() => {
-      this.database.exec('delete from sync_events; delete from usage_events; delete from printer_slots; delete from printers; delete from nfc_tags; delete from spools; delete from catalog_items;');
+      this.database.exec('delete from sync_events; delete from usage_events; delete from printer_slots; delete from printers; delete from nfc_tags; delete from spools; delete from catalog_items; delete from label_templates;');
       this.setInstanceId(snapshot.instance_id);
-      for (const item of snapshot.catalog_items) this.database.prepare(CATALOG_INSERT_SQL).run(item);
+      for (const item of snapshot.catalog_items) this.database.prepare(CATALOG_INSERT_SQL).run(serializeCatalogItem(item));
       for (const spool of snapshot.spools) this.database.prepare(SPOOL_INSERT_SQL).run(spool);
       for (const tag of snapshot.nfc_tags) this.database.prepare(NFC_INSERT_SQL).run(tag);
       for (const printer of snapshot.printers) this.database.prepare(PRINTER_INSERT_SQL).run(printer);
       for (const slot of snapshot.printer_slots) this.database.prepare(SLOT_INSERT_SQL).run(slot);
       for (const usage of snapshot.usage_events) this.database.prepare(USAGE_INSERT_SQL).run(usage);
+      for (const template of snapshot.label_templates) this.database.prepare(LABEL_TEMPLATE_INSERT_SQL).run(serializeLabelTemplate(template));
     });
   }
 
@@ -775,6 +878,8 @@ export class FilamentBridgeRepository {
         after_weight_g: after,
         review_status: status,
         notes: edit?.notes ?? current.notes,
+        estimated_material_cost_amount: estimateUsageCost(spool, delta),
+        estimated_material_cost_currency: spool.purchase_currency,
         updated_at: now
       };
       this.database.prepare(USAGE_UPDATE_SQL).run(nextEvent);
@@ -782,8 +887,14 @@ export class FilamentBridgeRepository {
     });
   }
 
-  private insertUsageEvent(input: Omit<UsageEvent, 'id'>): UsageEvent {
-    const event: UsageEvent = { id: randomUUID(), ...input };
+  private insertUsageEvent(input: Omit<UsageEvent, 'id' | 'estimated_material_cost_amount' | 'estimated_material_cost_currency'>): UsageEvent {
+    const spool = this.getSpool(input.spool_id);
+    const event: UsageEvent = {
+      id: randomUUID(),
+      ...input,
+      estimated_material_cost_amount: estimateUsageCost(spool, input.delta_weight_g),
+      estimated_material_cost_currency: spool.purchase_currency
+    };
     this.database.prepare(USAGE_INSERT_SQL).run(event);
     return event;
   }
@@ -839,6 +950,10 @@ function withoutExpectedVersion<T extends { expected_version: number }>(value: T
   return rest;
 }
 
+function stripUndefined<T extends Record<string, unknown>>(value: T): Partial<T> {
+  return Object.fromEntries(Object.entries(value).filter(([, child]) => child !== undefined)) as Partial<T>;
+}
+
 function mapDevice(row: unknown): Device {
   const device = row as Device & { trusted: 0 | 1 | boolean };
   return { ...device, trusted: Boolean(device.trusted) };
@@ -847,6 +962,72 @@ function mapDevice(row: unknown): Device {
 function mapSyncEvent(row: unknown): SyncEvent {
   const event = row as Omit<SyncEvent, 'payload'> & { payload: string };
   return { ...event, payload: JSON.parse(event.payload) as Record<string, unknown> };
+}
+
+function mapCatalogItem(row: unknown): FilamentCatalogItem {
+  const item = row as FilamentCatalogItem & { soluble?: 0 | 1 | boolean | null; support_material?: 0 | 1 | boolean | null };
+  return {
+    ...item,
+    max_volumetric_speed_mm3_s: item.max_volumetric_speed_mm3_s ?? null,
+    flow_ratio: item.flow_ratio ?? null,
+    pressure_advance: item.pressure_advance ?? null,
+    shrinkage_xy_percent: item.shrinkage_xy_percent ?? null,
+    shrinkage_z_percent: item.shrinkage_z_percent ?? null,
+    softening_temp_c: item.softening_temp_c ?? null,
+    required_nozzle_hrc: item.required_nozzle_hrc ?? null,
+    soluble: item.soluble === null || item.soluble === undefined ? null : Boolean(item.soluble),
+    support_material: item.support_material === null || item.support_material === undefined ? null : Boolean(item.support_material)
+  };
+}
+
+function serializeCatalogItem(item: FilamentCatalogItem): Omit<FilamentCatalogItem, 'soluble' | 'support_material'> & { soluble: 0 | 1 | null; support_material: 0 | 1 | null } {
+  return {
+    ...item,
+    soluble: item.soluble === null ? null : item.soluble ? 1 : 0,
+    support_material: item.support_material === null ? null : item.support_material ? 1 : 0
+  };
+}
+
+function mapSpool(row: unknown): Spool {
+  const spool = row as Spool;
+  return {
+    ...spool,
+    short_code: normalizeShortCode(spool.short_code ?? spool.id.slice(0, 8)),
+    purchase_price_amount: spool.purchase_price_amount ?? null,
+    purchase_currency: spool.purchase_currency ?? null,
+    vendor_lot: spool.vendor_lot ?? null
+  };
+}
+
+function mapLabelTemplate(row: unknown): LabelTemplate {
+  const template = row as Omit<LabelTemplate, 'included_fields'> & { included_fields: string };
+  return { ...template, included_fields: JSON.parse(template.included_fields) as LabelTemplate['included_fields'] };
+}
+
+function serializeLabelTemplate(template: LabelTemplate): Omit<LabelTemplate, 'included_fields'> & { included_fields: string } {
+  return { ...template, included_fields: JSON.stringify(template.included_fields) };
+}
+
+function normalizeShortCode(value: string): string {
+  const normalized = value.trim().toUpperCase();
+  if (!/^[A-Z0-9][A-Z0-9_-]{2,31}$/.test(normalized)) {
+    throw new RepositoryError('invalid_state', 'short code may contain 3-32 letters, numbers, dashes, and underscores');
+  }
+  return normalized;
+}
+
+function estimateUsageCost(spool: Spool, deltaWeightG: number): number | null {
+  if (spool.purchase_price_amount === null || spool.purchase_currency === null || spool.initial_filament_weight_g <= 0 || deltaWeightG >= 0) {
+    return null;
+  }
+  return Math.round((Math.abs(deltaWeightG) / spool.initial_filament_weight_g) * spool.purchase_price_amount * 100) / 100;
+}
+
+function ensureColumn(database: DatabaseSync, table: string, column: string, definition: string): void {
+  const existing = database.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>;
+  if (!existing.some((entry) => entry.name === column)) {
+    database.exec(`alter table ${table} add column ${column} ${definition}`);
+  }
 }
 
 const SCHEMA_SQL = `
@@ -921,6 +1102,15 @@ create table if not exists catalog_items (
   bambu_studio_preset_name text,
   orca_slicer_preset_name text,
   vendor_sku text,
+  max_volumetric_speed_mm3_s real,
+  flow_ratio real,
+  pressure_advance real,
+  shrinkage_xy_percent real,
+  shrinkage_z_percent real,
+  softening_temp_c integer,
+  required_nozzle_hrc real,
+  soluble integer,
+  support_material integer,
   notes text
 );
 
@@ -944,6 +1134,10 @@ create table if not exists spools (
   status text not null,
   storage_location text,
   notes text,
+  short_code text not null unique,
+  purchase_price_amount real,
+  purchase_currency text,
+  vendor_lot text,
   active_tag_id text
 );
 
@@ -1032,20 +1226,43 @@ create table if not exists usage_events (
   confidence text not null,
   review_status text not null,
   notes text,
+  estimated_material_cost_amount real,
+  estimated_material_cost_currency text,
   created_at text not null,
   updated_at text not null
 );
+
+create table if not exists label_templates (
+  id text primary key,
+  created_at text not null,
+  updated_at text not null,
+  deleted_at text,
+  version integer not null,
+  name text not null,
+  medium text not null,
+  page_width_mm real not null,
+  page_height_mm real not null,
+  label_width_mm real not null,
+  label_height_mm real not null,
+  rows integer not null,
+  columns integer not null,
+  code_type text not null,
+  template_text text not null,
+  included_fields text not null,
+  created_by_user_id text not null,
+  last_used_at text
+);
 `;
 
-const CATALOG_INSERT_SQL = `insert into catalog_items(id, created_at, updated_at, deleted_at, version, brand, product_line, material_type, diameter_mm, color_name, color_hex, nozzle_temp_min_c, nozzle_temp_max_c, bed_temp_min_c, bed_temp_max_c, drying_temp_c, drying_time_minutes, density_g_cm3, bambu_studio_preset_name, orca_slicer_preset_name, vendor_sku, notes)
-values(@id, @created_at, @updated_at, @deleted_at, @version, @brand, @product_line, @material_type, @diameter_mm, @color_name, @color_hex, @nozzle_temp_min_c, @nozzle_temp_max_c, @bed_temp_min_c, @bed_temp_max_c, @drying_temp_c, @drying_time_minutes, @density_g_cm3, @bambu_studio_preset_name, @orca_slicer_preset_name, @vendor_sku, @notes)`;
+const CATALOG_INSERT_SQL = `insert into catalog_items(id, created_at, updated_at, deleted_at, version, brand, product_line, material_type, diameter_mm, color_name, color_hex, nozzle_temp_min_c, nozzle_temp_max_c, bed_temp_min_c, bed_temp_max_c, drying_temp_c, drying_time_minutes, density_g_cm3, bambu_studio_preset_name, orca_slicer_preset_name, vendor_sku, max_volumetric_speed_mm3_s, flow_ratio, pressure_advance, shrinkage_xy_percent, shrinkage_z_percent, softening_temp_c, required_nozzle_hrc, soluble, support_material, notes)
+values(@id, @created_at, @updated_at, @deleted_at, @version, @brand, @product_line, @material_type, @diameter_mm, @color_name, @color_hex, @nozzle_temp_min_c, @nozzle_temp_max_c, @bed_temp_min_c, @bed_temp_max_c, @drying_temp_c, @drying_time_minutes, @density_g_cm3, @bambu_studio_preset_name, @orca_slicer_preset_name, @vendor_sku, @max_volumetric_speed_mm3_s, @flow_ratio, @pressure_advance, @shrinkage_xy_percent, @shrinkage_z_percent, @softening_temp_c, @required_nozzle_hrc, @soluble, @support_material, @notes)`;
 
-const CATALOG_UPDATE_SQL = `update catalog_items set created_at=@created_at, updated_at=@updated_at, deleted_at=@deleted_at, version=@version, brand=@brand, product_line=@product_line, material_type=@material_type, diameter_mm=@diameter_mm, color_name=@color_name, color_hex=@color_hex, nozzle_temp_min_c=@nozzle_temp_min_c, nozzle_temp_max_c=@nozzle_temp_max_c, bed_temp_min_c=@bed_temp_min_c, bed_temp_max_c=@bed_temp_max_c, drying_temp_c=@drying_temp_c, drying_time_minutes=@drying_time_minutes, density_g_cm3=@density_g_cm3, bambu_studio_preset_name=@bambu_studio_preset_name, orca_slicer_preset_name=@orca_slicer_preset_name, vendor_sku=@vendor_sku, notes=@notes where id=@id`;
+const CATALOG_UPDATE_SQL = `update catalog_items set created_at=@created_at, updated_at=@updated_at, deleted_at=@deleted_at, version=@version, brand=@brand, product_line=@product_line, material_type=@material_type, diameter_mm=@diameter_mm, color_name=@color_name, color_hex=@color_hex, nozzle_temp_min_c=@nozzle_temp_min_c, nozzle_temp_max_c=@nozzle_temp_max_c, bed_temp_min_c=@bed_temp_min_c, bed_temp_max_c=@bed_temp_max_c, drying_temp_c=@drying_temp_c, drying_time_minutes=@drying_time_minutes, density_g_cm3=@density_g_cm3, bambu_studio_preset_name=@bambu_studio_preset_name, orca_slicer_preset_name=@orca_slicer_preset_name, vendor_sku=@vendor_sku, max_volumetric_speed_mm3_s=@max_volumetric_speed_mm3_s, flow_ratio=@flow_ratio, pressure_advance=@pressure_advance, shrinkage_xy_percent=@shrinkage_xy_percent, shrinkage_z_percent=@shrinkage_z_percent, softening_temp_c=@softening_temp_c, required_nozzle_hrc=@required_nozzle_hrc, soluble=@soluble, support_material=@support_material, notes=@notes where id=@id`;
 
-const SPOOL_INSERT_SQL = `insert into spools(id, created_at, updated_at, deleted_at, version, catalog_item_id, display_name, manufacturer_name, material_type, diameter_mm, color_hex, initial_filament_weight_g, remaining_filament_weight_g, empty_spool_weight_g, purchase_date, opened_at, status, storage_location, notes, active_tag_id)
-values(@id, @created_at, @updated_at, @deleted_at, @version, @catalog_item_id, @display_name, @manufacturer_name, @material_type, @diameter_mm, @color_hex, @initial_filament_weight_g, @remaining_filament_weight_g, @empty_spool_weight_g, @purchase_date, @opened_at, @status, @storage_location, @notes, @active_tag_id)`;
+const SPOOL_INSERT_SQL = `insert into spools(id, created_at, updated_at, deleted_at, version, catalog_item_id, display_name, manufacturer_name, material_type, diameter_mm, color_hex, initial_filament_weight_g, remaining_filament_weight_g, empty_spool_weight_g, purchase_date, opened_at, status, storage_location, notes, short_code, purchase_price_amount, purchase_currency, vendor_lot, active_tag_id)
+values(@id, @created_at, @updated_at, @deleted_at, @version, @catalog_item_id, @display_name, @manufacturer_name, @material_type, @diameter_mm, @color_hex, @initial_filament_weight_g, @remaining_filament_weight_g, @empty_spool_weight_g, @purchase_date, @opened_at, @status, @storage_location, @notes, @short_code, @purchase_price_amount, @purchase_currency, @vendor_lot, @active_tag_id)`;
 
-const SPOOL_UPDATE_SQL = `update spools set created_at=@created_at, updated_at=@updated_at, deleted_at=@deleted_at, version=@version, catalog_item_id=@catalog_item_id, display_name=@display_name, manufacturer_name=@manufacturer_name, material_type=@material_type, diameter_mm=@diameter_mm, color_hex=@color_hex, initial_filament_weight_g=@initial_filament_weight_g, remaining_filament_weight_g=@remaining_filament_weight_g, empty_spool_weight_g=@empty_spool_weight_g, purchase_date=@purchase_date, opened_at=@opened_at, status=@status, storage_location=@storage_location, notes=@notes, active_tag_id=@active_tag_id where id=@id`;
+const SPOOL_UPDATE_SQL = `update spools set created_at=@created_at, updated_at=@updated_at, deleted_at=@deleted_at, version=@version, catalog_item_id=@catalog_item_id, display_name=@display_name, manufacturer_name=@manufacturer_name, material_type=@material_type, diameter_mm=@diameter_mm, color_hex=@color_hex, initial_filament_weight_g=@initial_filament_weight_g, remaining_filament_weight_g=@remaining_filament_weight_g, empty_spool_weight_g=@empty_spool_weight_g, purchase_date=@purchase_date, opened_at=@opened_at, status=@status, storage_location=@storage_location, notes=@notes, short_code=@short_code, purchase_price_amount=@purchase_price_amount, purchase_currency=@purchase_currency, vendor_lot=@vendor_lot, active_tag_id=@active_tag_id where id=@id`;
 
 const NFC_INSERT_SQL = `insert into nfc_tags(id, created_at, updated_at, deleted_at, version, tag_uid_hash, format, payload_version, assigned_spool_id, instance_id, public_key_id, last_written_at, last_read_at, write_count, status, last_payload_hash)
 values(@id, @created_at, @updated_at, @deleted_at, @version, @tag_uid_hash, @format, @payload_version, @assigned_spool_id, @instance_id, @public_key_id, @last_written_at, @last_read_at, @write_count, @status, @last_payload_hash)`;
@@ -1065,7 +1282,12 @@ const SLOT_UPDATE_SQL = `update printer_slots set created_at=@created_at, update
 const SYNC_INSERT_SQL = `insert into sync_events(id, source, source_device_id, entity_type, entity_id, event_type, payload, status, created_at, applied_at, error_message)
 values(@id, @source, @source_device_id, @entity_type, @entity_id, @event_type, @payload, @status, @created_at, @applied_at, @error_message)`;
 
-const USAGE_INSERT_SQL = `insert into usage_events(id, spool_id, source, printer_id, printer_slot_id, job_id, delta_weight_g, before_weight_g, after_weight_g, confidence, review_status, notes, created_at, updated_at)
-values(@id, @spool_id, @source, @printer_id, @printer_slot_id, @job_id, @delta_weight_g, @before_weight_g, @after_weight_g, @confidence, @review_status, @notes, @created_at, @updated_at)`;
+const USAGE_INSERT_SQL = `insert into usage_events(id, spool_id, source, printer_id, printer_slot_id, job_id, delta_weight_g, before_weight_g, after_weight_g, confidence, review_status, notes, estimated_material_cost_amount, estimated_material_cost_currency, created_at, updated_at)
+values(@id, @spool_id, @source, @printer_id, @printer_slot_id, @job_id, @delta_weight_g, @before_weight_g, @after_weight_g, @confidence, @review_status, @notes, @estimated_material_cost_amount, @estimated_material_cost_currency, @created_at, @updated_at)`;
 
-const USAGE_UPDATE_SQL = `update usage_events set spool_id=@spool_id, source=@source, printer_id=@printer_id, printer_slot_id=@printer_slot_id, job_id=@job_id, delta_weight_g=@delta_weight_g, before_weight_g=@before_weight_g, after_weight_g=@after_weight_g, confidence=@confidence, review_status=@review_status, notes=@notes, created_at=@created_at, updated_at=@updated_at where id=@id`;
+const USAGE_UPDATE_SQL = `update usage_events set spool_id=@spool_id, source=@source, printer_id=@printer_id, printer_slot_id=@printer_slot_id, job_id=@job_id, delta_weight_g=@delta_weight_g, before_weight_g=@before_weight_g, after_weight_g=@after_weight_g, confidence=@confidence, review_status=@review_status, notes=@notes, estimated_material_cost_amount=@estimated_material_cost_amount, estimated_material_cost_currency=@estimated_material_cost_currency, created_at=@created_at, updated_at=@updated_at where id=@id`;
+
+const LABEL_TEMPLATE_INSERT_SQL = `insert into label_templates(id, created_at, updated_at, deleted_at, version, name, medium, page_width_mm, page_height_mm, label_width_mm, label_height_mm, rows, columns, code_type, template_text, included_fields, created_by_user_id, last_used_at)
+values(@id, @created_at, @updated_at, @deleted_at, @version, @name, @medium, @page_width_mm, @page_height_mm, @label_width_mm, @label_height_mm, @rows, @columns, @code_type, @template_text, @included_fields, @created_by_user_id, @last_used_at)`;
+
+const LABEL_TEMPLATE_UPDATE_SQL = `update label_templates set created_at=@created_at, updated_at=@updated_at, deleted_at=@deleted_at, version=@version, name=@name, medium=@medium, page_width_mm=@page_width_mm, page_height_mm=@page_height_mm, label_width_mm=@label_width_mm, label_height_mm=@label_height_mm, rows=@rows, columns=@columns, code_type=@code_type, template_text=@template_text, included_fields=@included_fields, created_by_user_id=@created_by_user_id, last_used_at=@last_used_at where id=@id`;

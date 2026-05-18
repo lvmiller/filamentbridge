@@ -67,6 +67,8 @@ const versionSchema = z.number().int().min(1);
 const jsonRecordSchema = z.record(z.unknown());
 const mqttDeviceIdSchema = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/, 'device id cannot contain MQTT topic separators or wildcards');
 const lanAccessCodeInputSchema = z.string().trim().max(128);
+const optionalMoneyAmountSchema = z.number().nonnegative().max(1_000_000).nullable();
+const shortCodeSchema = z.string().trim().min(3).max(32).regex(/^[A-Z0-9][A-Z0-9_-]*$/i, 'short code may contain letters, numbers, dashes, and underscores');
 
 export const entitySchema = z.object({
   id: idSchema,
@@ -94,6 +96,15 @@ export const filamentCatalogItemSchema = entitySchema.extend({
   bambu_studio_preset_name: z.string().max(240).nullable(),
   orca_slicer_preset_name: z.string().max(240).nullable(),
   vendor_sku: z.string().max(240).nullable(),
+  max_volumetric_speed_mm3_s: z.number().positive().max(1000).nullable(),
+  flow_ratio: z.number().positive().max(3).nullable(),
+  pressure_advance: z.number().min(0).max(10).nullable(),
+  shrinkage_xy_percent: z.number().min(-100).max(100).nullable(),
+  shrinkage_z_percent: z.number().min(-100).max(100).nullable(),
+  softening_temp_c: z.number().int().min(0).max(400).nullable(),
+  required_nozzle_hrc: z.number().min(0).max(100).nullable(),
+  soluble: z.boolean().nullable(),
+  support_material: z.boolean().nullable(),
   notes: nullableStringSchema
 });
 export type FilamentCatalogItem = z.infer<typeof filamentCatalogItemSchema>;
@@ -104,6 +115,16 @@ export const createCatalogItemSchema = filamentCatalogItemSchema.omit({
   updated_at: true,
   deleted_at: true,
   version: true
+}).extend({
+  max_volumetric_speed_mm3_s: z.number().positive().max(1000).nullable().optional().default(null),
+  flow_ratio: z.number().positive().max(3).nullable().optional().default(null),
+  pressure_advance: z.number().min(0).max(10).nullable().optional().default(null),
+  shrinkage_xy_percent: z.number().min(-100).max(100).nullable().optional().default(null),
+  shrinkage_z_percent: z.number().min(-100).max(100).nullable().optional().default(null),
+  softening_temp_c: z.number().int().min(0).max(400).nullable().optional().default(null),
+  required_nozzle_hrc: z.number().min(0).max(100).nullable().optional().default(null),
+  soluble: z.boolean().nullable().optional().default(null),
+  support_material: z.boolean().nullable().optional().default(null)
 });
 export type CreateCatalogItemInput = z.infer<typeof createCatalogItemSchema>;
 
@@ -127,6 +148,10 @@ export const spoolSchema = entitySchema.extend({
   status: z.enum(spoolStatuses),
   storage_location: z.string().max(240).nullable(),
   notes: nullableStringSchema,
+  short_code: shortCodeSchema,
+  purchase_price_amount: optionalMoneyAmountSchema,
+  purchase_currency: z.string().trim().length(3).toUpperCase().nullable(),
+  vendor_lot: z.string().max(120).nullable(),
   active_tag_id: idSchema.nullable()
 });
 export type Spool = z.infer<typeof spoolSchema>;
@@ -138,6 +163,11 @@ export const createSpoolSchema = spoolSchema.omit({
   deleted_at: true,
   version: true,
   active_tag_id: true
+}).extend({
+  short_code: shortCodeSchema.optional(),
+  purchase_price_amount: optionalMoneyAmountSchema.optional().default(null),
+  purchase_currency: z.string().trim().length(3).toUpperCase().nullable().optional().default(null),
+  vendor_lot: z.string().max(120).nullable().optional().default(null)
 }).superRefine((value, ctx) => {
   if (value.remaining_filament_weight_g > value.initial_filament_weight_g) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['remaining_filament_weight_g'], message: 'remaining weight cannot exceed initial filament weight' });
@@ -279,6 +309,8 @@ export const usageEventSchema = z.object({
   confidence: z.enum(usageConfidenceLevels),
   review_status: z.enum(usageReviewStatuses),
   notes: nullableStringSchema,
+  estimated_material_cost_amount: optionalMoneyAmountSchema,
+  estimated_material_cost_currency: z.string().trim().length(3).toUpperCase().nullable(),
   created_at: isoDateTimeSchema,
   updated_at: isoDateTimeSchema
 });
@@ -395,6 +427,53 @@ export const catalogImportSchema = z.object({
 });
 export type CatalogImportInput = z.infer<typeof catalogImportSchema>;
 
+export const labelTemplateSchema = entitySchema.extend({
+  name: z.string().min(1).max(120),
+  medium: z.enum(['sheet', 'roll', 'thermal', 'custom']),
+  page_width_mm: z.number().positive().max(1000),
+  page_height_mm: z.number().positive().max(1000),
+  label_width_mm: z.number().positive().max(300),
+  label_height_mm: z.number().positive().max(300),
+  rows: z.number().int().min(1).max(100),
+  columns: z.number().int().min(1).max(100),
+  code_type: z.enum(['qr', 'barcode', 'none']),
+  template_text: z.string().min(1).max(2000),
+  included_fields: z.array(z.enum(['short_code', 'display_name', 'material_type', 'color_hex', 'remaining_filament_weight_g', 'storage_location', 'vendor_lot'])).min(1).max(20),
+  created_by_user_id: idSchema,
+  last_used_at: isoDateTimeSchema.nullable()
+});
+export type LabelTemplate = z.infer<typeof labelTemplateSchema>;
+
+export const createLabelTemplateSchema = labelTemplateSchema.omit({
+  id: true,
+  created_at: true,
+  updated_at: true,
+  deleted_at: true,
+  version: true,
+  last_used_at: true,
+  created_by_user_id: true,
+});
+export type CreateLabelTemplateInput = z.infer<typeof createLabelTemplateSchema>;
+
+export const patchLabelTemplateSchema = createLabelTemplateSchema.partial().extend({
+  expected_version: versionSchema
+});
+export type PatchLabelTemplateInput = z.infer<typeof patchLabelTemplateSchema>;
+
+export const renderLabelsSchema = z.object({
+  template_id: idSchema,
+  spool_ids: z.array(idSchema).min(1).max(100),
+  base_url: z.string().url().max(500).nullable().optional().default(null)
+});
+export type RenderLabelsInput = z.infer<typeof renderLabelsSchema>;
+
+export type RenderedLabels = {
+  mime_type: 'image/svg+xml';
+  filename: string;
+  svg: string;
+};
+
+
 export const exportFileSchema = z.object({
   format: z.literal(EXPORT_FORMAT),
   exported_at: isoDateTimeSchema,
@@ -404,7 +483,8 @@ export const exportFileSchema = z.object({
   nfc_tags: z.array(nfcTagSchema),
   printers: z.array(printerSchema),
   printer_slots: z.array(printerSlotSchema),
-  usage_events: z.array(usageEventSchema)
+  usage_events: z.array(usageEventSchema),
+  label_templates: z.array(labelTemplateSchema).default([])
 });
 export type FilamentBridgeExport = z.infer<typeof exportFileSchema>;
 

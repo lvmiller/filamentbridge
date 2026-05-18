@@ -36,9 +36,16 @@ describe('FilamentBridge API integration', () => {
     const catalog = await post('/api/catalog-items', catalogPayload());
     const spool = await post('/api/spools', spoolPayload(catalog.id));
     expect(spool.remaining_filament_weight_g).toBe(1000);
+    expect(spool.short_code).toMatch(/^FB-/);
+    expect((await get(`/api/spools/lookup?code=${spool.short_code}`)).id).toBe(spool.id);
+    const labelTemplate = await post('/api/labels/templates', { name: 'Default QR labels', medium: 'sheet', page_width_mm: 210, page_height_mm: 297, label_width_mm: 70, label_height_mm: 35, rows: 8, columns: 2, code_type: 'qr', template_text: '{{display_name}}\\n{{short_code}}', included_fields: ['short_code', 'remaining_filament_weight_g'] });
+    const renderedLabels = await post('/api/labels/render', { template_id: labelTemplate.id, spool_ids: [spool.id], base_url: 'http://localhost:3000' });
+    expect(renderedLabels.mime_type).toBe('image/svg+xml');
+    expect(renderedLabels.svg).toContain(spool.short_code);
 
     const adjusted = await post('/api/usage-events/adjustment', { spool_id: spool.id, expected_version: spool.version, new_remaining_weight_g: 900, notes: 'scale' });
     expect(adjusted.spool.remaining_filament_weight_g).toBe(900);
+    expect(adjusted.usage_event.estimated_material_cost_amount).toBe(2.5);
     await expect(post('/api/usage-events/adjustment', { spool_id: spool.id, expected_version: spool.version, new_remaining_weight_g: 800, notes: null })).rejects.toThrow(/409/);
 
     const assigned = await post('/api/nfc/assign', { spool_id: spool.id, tag_uid: 'demo-tag', expected_spool_version: adjusted.spool.version });
@@ -132,5 +139,5 @@ function catalogPayload(): Record<string, unknown> {
 }
 
 function spoolPayload(catalogId: string): Record<string, unknown> {
-  return { catalog_item_id: catalogId, display_name: 'Blue PLA', manufacturer_name: 'Bambu Lab', material_type: 'PLA', diameter_mm: 1.75, color_hex: '#1e88e5', initial_filament_weight_g: 1000, remaining_filament_weight_g: 1000, empty_spool_weight_g: 250, purchase_date: null, opened_at: null, status: 'sealed', storage_location: 'Shelf', notes: null };
+  return { catalog_item_id: catalogId, display_name: 'Blue PLA', manufacturer_name: 'Bambu Lab', material_type: 'PLA', diameter_mm: 1.75, color_hex: '#1e88e5', initial_filament_weight_g: 1000, remaining_filament_weight_g: 1000, empty_spool_weight_g: 250, purchase_date: null, opened_at: null, status: 'sealed', storage_location: 'Shelf', notes: null, purchase_price_amount: 24.99, purchase_currency: 'USD', vendor_lot: 'LOT-1' };
 }

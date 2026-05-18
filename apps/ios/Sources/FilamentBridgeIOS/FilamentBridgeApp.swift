@@ -32,6 +32,7 @@ struct RootView: View {
                     PairingView(session: $session)
                 } else {
                     NavigationLink("Scan tag") { ScanTagView(spools: $spools) }
+                    NavigationLink("Scan label") { LabelLookupView(selectedSpool: $selectedSpool) }
                     NavigationLink("Assign blank tag") { AssignTagView(spools: $spools) }
                     NavigationLink("Spool summary") { SpoolSummaryView(spools: $spools, selectedSpool: $selectedSpool) }
                     NavigationLink("Manual weight adjustment") { ManualAdjustmentView(spool: $selectedSpool) }
@@ -100,6 +101,31 @@ struct ScanTagView: View {
             }
             if let result { Text(result.message); if let spool = result.spool { Text("\(spool.displayName): \(spool.remainingFilamentWeightG) g") } }
         }.navigationTitle("Scan tag")
+    }
+}
+
+struct LabelLookupView: View {
+    @EnvironmentObject private var client: FilamentBridgeAPIClient
+    @Binding var selectedSpool: Spool?
+    @State private var code = ""
+    @State private var message = "QR/barcode label scan found a spool or reported no active match. Enter the short code printed on a local label."
+
+    var body: some View {
+        Form {
+            TextField("Short code or label code", text: $code).textInputAutocapitalization(.characters)
+            Button("Lookup label") {
+                Task {
+                    do {
+                        let spool = try await client.lookupSpool(code: code)
+                        selectedSpool = spool
+                        message = "Found \(spool.displayName)"
+                    } catch {
+                        message = "QR/barcode label scan did not match any active spool."
+                    }
+                }
+            }
+            Text(message).font(.footnote)
+        }.navigationTitle("Scan label")
     }
 }
 

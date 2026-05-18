@@ -5,6 +5,7 @@ import fastifyStatic from '@fastify/static';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 import bcrypt from 'bcryptjs';
+import QRCode from 'qrcode';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { ZodError, type ZodTypeAny } from 'zod';
 import {
@@ -14,12 +15,14 @@ import {
   classifyRawNfcPayload,
   completePairingSchema,
   createCatalogItemSchema,
+  createLabelTemplateSchema,
   createPrinterSchema,
   createSpoolSchema,
   decodePayloadBase64Url,
   editUsageEventSchema,
   encodePayloadBase64Url,
   exportFileSchema,
+  renderLabelsSchema,
   loginSchema,
   manualAdjustmentSchema,
   mapPrinterSlotSchema,
@@ -31,6 +34,7 @@ import {
   nowIso,
   patchCatalogItemSchema,
   patchPrinterSchema,
+  patchLabelTemplateSchema,
   patchSpoolSchema,
   setupOwnerSchema,
   startPairingSchema,
@@ -40,13 +44,17 @@ import {
   type CreateCatalogItemInput,
   type CreatePrinterInput,
   type CreateSpoolInput,
+  type CreateLabelTemplateInput,
   type FilamentBridgeExport,
   type NfcScanResult,
   type NfcWritePayloadResult,
   type PrinterSlot,
+  type LabelTemplate,
+  type Spool,
   type SetupStatus,
   type SyncSubmissionResult,
   type TestConnectionResult,
+  type RenderedLabels,
   type UsageReviewStatus
 } from '../../../packages/shared/src/index';
 import {
@@ -70,7 +78,7 @@ import {
   type SecretBox,
   type SigningKeyStore
 } from '../../../packages/crypto/src/index';
-import { BambuLanMqttConnector, ManualMockBambuConnector, capabilityForModel, type BambuLanMqttCredentials, type PrinterConnector } from '../../../packages/printer-connector/src/index';
+import { BambuLanMqttConnector, BambuMqttConnectionServer, ManualMockBambuConnector, capabilityForModel, type BambuLanMqttCredentials, type PrinterConnector } from '../../../packages/printer-connector/src/index';
 
 export type ServerConfig = {
   databasePath: string;
@@ -133,16 +141,20 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     repo.setInstanceId(signingKeyStore.instance_id);
   }
   const secretKey = createSecretKey(config.appSecret);
-  const connector = options.connector ?? (config.printerConnectorEnabled
+  const connector: PrinterConnector = options.connector ?? (config.printerConnectorEnabled
     ? new BambuLanMqttConnector({
       fallback: new ManualMockBambuConnector(),
-      resolveCredentials: (printer) => resolveBambuLanMqttCredentials(printer.lan_access_code_secret_ref, secretKey, config.bambuMqttAllowInsecureTls)
+      resolveCredentials: (printer) => resolveBambuLanMqttCredentials(printer.lan_access_code_secret_ref, secretKey, config.bambuMqttAllowInsecureTls),
+      snapshot_source: new BambuMqttConnectionServer(),
     })
     : new ManualMockBambuConnector());
   const salt = repo.getMeta('hash_salt') ?? safeToken(24);
   repo.setMetaIfMissing('hash_salt', salt);
 
   const app = Fastify({ logger: options.logger ?? false });
+  app.addHook('onClose', async () => {
+    await connector.stop?.();
+  });
   await app.register(cookie, { secret: config.appSecret });
   await app.register(swagger, {
     openapi: {
@@ -284,6 +296,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     const input = parseBody(createSpoolSchema, request.body) as CreateSpoolInput;
     return { data: repo.createSpool(input) };
   });
+  app.get('/api/spools/lookup', async (request) => {
+    const code = (request.query as { code?: string }).code;
+    if (typeof code !== 'string' || code.trim().length === 0) {
+      throw new RepositoryError('invalid_state', 'code query parameter is required');
+    }
+    return { data: repo.getSpoolByCode(code) };
+  });
   app.get('/api/spools/:id', async (request) => ({ data: repo.getSpool((request.params as { id: string }).id) }));
   app.patch('/api/spools/:id', async (request) => ({ data: repo.updateSpool((request.params as { id: string }).id, parseBody(patchSpoolSchema, request.body) as never) }));
   app.post('/api/spools/:id/retire', async (request) => {
@@ -293,6 +312,24 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
   app.post('/api/spools/:id/delete', async (request) => {
     const body = parseExpectedVersion(request.body);
     return { data: repo.deleteSpool((request.params as { id: string }).id, body.expected_version) };
+  });
+
+  app.get('/api/labels/templates', async () => ({ data: repo.listLabelTemplates() }));
+  app.post('/api/labels/templates', async (request) => {
+    const input = parseBody(createLabelTemplateSchema, request.body) as CreateLabelTemplateInput;
+    const auth = (request as AuthedRequest).auth;
+    return { data: repo.createLabelTemplate({ ...input, created_by_user_id: auth.user.id }) };
+  });
+  app.patch('/api/labels/templates/:id', async (request) => ({
+    data: repo.updateLabelTemplate((request.params as { id: string }).id, parseBody(patchLabelTemplateSchema, request.body) as never)
+  }));
+  app.post('/api/labels/render', async (request): Promise<{ data: RenderedLabels }> => {
+    const input = parseBody(renderLabelsSchema, request.body);
+    const template = repo.getLabelTemplate(input.template_id);
+    const spools = input.spool_ids.map((id) => repo.getSpool(id));
+    const rendered = await renderSpoolLabels(template, spools, input.base_url);
+    repo.touchLabelTemplateUsed(template.id);
+    return { data: rendered };
   });
 
   app.post('/api/usage-events/adjustment', async (request) => {
@@ -583,6 +620,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Fastify
     });
   }
 
+  await connector.start?.();
+
   return app;
 }
 
@@ -710,6 +749,109 @@ function normalizeNullableSecret(value: string | null): string | null {
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+async function renderSpoolLabels(template: LabelTemplate, spools: Spool[], baseUrl: string | null): Promise<RenderedLabels> {
+  const pageWidth = template.page_width_mm;
+  const pageHeight = template.page_height_mm;
+  const gap = 2;
+  const labels = await Promise.all(spools.map(async (spool, index) => {
+    const column = index % template.columns;
+    const row = Math.floor(index / template.columns) % template.rows;
+    const page = Math.floor(index / (template.rows * template.columns));
+    const x = gap + column * (template.label_width_mm + gap);
+    const y = page * pageHeight + gap + row * (template.label_height_mm + gap);
+    return renderSingleSpoolLabel(template, spool, baseUrl, x, y);
+  }));
+  const pageCount = Math.max(1, Math.ceil(spools.length / (template.rows * template.columns)));
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${pageWidth}mm" height="${pageHeight * pageCount}mm" viewBox="0 0 ${pageWidth} ${pageHeight * pageCount}" role="img" aria-label="${escapeXml(template.name)} labels"><rect width="100%" height="100%" fill="white"/>${labels.join('')}</svg>`;
+  return { mime_type: 'image/svg+xml', filename: `${safeFilePart(template.name)}.svg`, svg };
+}
+
+async function renderSingleSpoolLabel(template: LabelTemplate, spool: Spool, baseUrl: string | null, x: number, y: number): Promise<string> {
+  const padding = 2;
+  const codeSize = Math.min(template.label_width_mm * 0.34, template.label_height_mm - padding * 2);
+  const codeX = x + template.label_width_mm - codeSize - padding;
+  const codeY = y + padding;
+  const payload = labelPayload(spool, baseUrl);
+  const code = template.code_type === 'qr'
+    ? renderQr(payload, codeX, codeY, codeSize)
+    : template.code_type === 'barcode'
+      ? renderCode39(spool.short_code, codeX, codeY, codeSize, Math.max(8, codeSize * 0.45))
+      : '';
+  const lines = labelTextLines(template, spool);
+  const text = lines.map((line, index) => `<text x="${x + padding}" y="${y + padding + 4 + index * 4.2}" font-size="3.2" font-family="Arial, sans-serif">${escapeXml(line)}</text>`).join('');
+  return `<g><rect x="${x}" y="${y}" width="${template.label_width_mm}" height="${template.label_height_mm}" rx="1.5" fill="#fff" stroke="#1f2937" stroke-width="0.2"/>${text}${code}<text x="${x + padding}" y="${y + template.label_height_mm - 2.2}" font-size="3" font-family="Arial, sans-serif" font-weight="700">${escapeXml(spool.short_code)}</text></g>`;
+}
+
+function labelPayload(spool: Spool, baseUrl: string | null): string {
+  return baseUrl === null ? spool.short_code : `${baseUrl.replace(/\/$/, '')}/api/spools/lookup?code=${encodeURIComponent(spool.short_code)}`;
+}
+
+function labelTextLines(template: LabelTemplate, spool: Spool): string[] {
+  const values: Record<string, string> = {
+    short_code: spool.short_code,
+    display_name: spool.display_name,
+    material_type: spool.material_type,
+    color_hex: spool.color_hex,
+    remaining_filament_weight_g: `${spool.remaining_filament_weight_g} g`,
+    storage_location: spool.storage_location ?? '',
+    vendor_lot: spool.vendor_lot ?? ''
+  };
+  const rendered = template.template_text.replace(/\{\{\s*([a-z_]+)\s*\}\}/g, (_match, key: string) => values[key] ?? '');
+  const fieldLines = template.included_fields.map((field) => values[field]).filter((value): value is string => typeof value === 'string' && value.length > 0);
+  return [...rendered.split(/\r?\n/), ...fieldLines].filter((value, index, array) => value.trim().length > 0 && array.indexOf(value) === index).slice(0, 5);
+}
+
+function renderQr(payload: string, x: number, y: number, size: number): string {
+  const qr = QRCode.create(payload, { errorCorrectionLevel: 'M' }) as unknown as { modules: { size: number; get(row: number, column: number): number } };
+  const cell = size / qr.modules.size;
+  const rects: string[] = [];
+  for (let row = 0; row < qr.modules.size; row += 1) {
+    for (let column = 0; column < qr.modules.size; column += 1) {
+      if (qr.modules.get(row, column) !== 0) {
+        rects.push(`<rect x="${(x + column * cell).toFixed(3)}" y="${(y + row * cell).toFixed(3)}" width="${cell.toFixed(3)}" height="${cell.toFixed(3)}"/>`);
+      }
+    }
+  }
+  return `<g fill="#111827">${rects.join('')}</g>`;
+}
+
+const CODE39_PATTERNS: Record<string, string> = {
+  '0': 'nnnwwnwnn', '1': 'wnnwnnnnw', '2': 'nnwwnnnnw', '3': 'wnwwnnnnn', '4': 'nnnwwnnnw',
+  '5': 'wnnwwnnnn', '6': 'nnwwwnnnn', '7': 'nnnwnnwnw', '8': 'wnnwnnwnn', '9': 'nnwwnnwnn',
+  A: 'wnnnnwnnw', B: 'nnwnnwnnw', C: 'wnwnnwnnn', D: 'nnnnwwnnw', E: 'wnnnwwnnn',
+  F: 'nnwnwwnnn', G: 'nnnnnwwnw', H: 'wnnnnwwnn', I: 'nnwnnwwnn', J: 'nnnnwwwnn',
+  K: 'wnnnnnnww', L: 'nnwnnnnww', M: 'wnwnnnnwn', N: 'nnnnwnnww', O: 'wnnnwnnwn',
+  P: 'nnwnwnnwn', Q: 'nnnnnnwww', R: 'wnnnnnwwn', S: 'nnwnnnwwn', T: 'nnnnwnwwn',
+  U: 'wwnnnnnnw', V: 'nwwnnnnnw', W: 'wwwnnnnnn', X: 'nwnnwnnnw', Y: 'wwnnwnnnn',
+  Z: 'nwwnwnnnn', '-': 'nwnnnnwnw', '.': 'wwnnnnwnn', ' ': 'nwwnnnwnn', '*': 'nwnnwnwnn'
+};
+
+function renderCode39(value: string, x: number, y: number, width: number, height: number): string {
+  const encoded = `*${value.toUpperCase().replace(/[^A-Z0-9 .-]/g, '')}*`;
+  const units = encoded.length * 13;
+  const narrow = width / units;
+  let cursor = x;
+  const bars: string[] = [];
+  for (const char of encoded) {
+    const pattern = CODE39_PATTERNS[char] ?? CODE39_PATTERNS['-']!;
+    for (let index = 0; index < pattern.length; index += 1) {
+      const lineWidth = narrow * (pattern.charAt(index) === 'w' ? 2.5 : 1);
+      if (index % 2 === 0) bars.push(`<rect x="${cursor.toFixed(3)}" y="${y.toFixed(3)}" width="${lineWidth.toFixed(3)}" height="${height.toFixed(3)}"/>`);
+      cursor += lineWidth;
+    }
+    cursor += narrow;
+  }
+  return `<g fill="#111827">${bars.join('')}</g>`;
+}
+
+function escapeXml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' })[char] ?? char);
+}
+
+function safeFilePart(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'labels';
 }
 
 function applyCors(request: FastifyRequest, reply: FastifyReply, allowedOrigins: string[]): void {
